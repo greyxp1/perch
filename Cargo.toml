@@ -1,0 +1,32 @@
+[package]
+name = "perch"
+version = "0.2.0"
+edition = "2024"
+license = "MIT"
+description = "Tiny native Wayland image pinning daemon"
+
+[dependencies]
+image = { version = "0.25.10", default-features = false, features = ["exr", "ff", "avif-native", "jpeg", "webp", "tiff", "gif", "bmp", "ico", "pnm", "qoi", "tga", "hdr"] }
+image-extras = "0.1.1"
+libheif-sys = { version = "5.3.1", features = ["v1_23"] }
+jxl-oxide = { version = "0.12.6", features = ["moxcms"] }
+resvg = "0.48.1"
+tiff = "0.11.3"
+fast_image_resize = { version = "6", features = ["only_u8x4"] }
+memmap2 = "0.9"
+moxcms = "0.8.1"
+libc = "0.2"
+rustix = { version = "1.1.6", features = ["net", "fs", "process", "event"] }
+xkbcommon = "0.9"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
+spng = { version = "0.2.0-alpha.3", features = ["zlib-ng"] }
+
+[build-dependencies]
+bindgen = { version = "0.72.1", default-features = false, features = ["runtime"] }
+pkg-config = "0.3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
