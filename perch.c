@@ -887,6 +887,24 @@ static int run_client(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+    uint8_t stdin_packet[4097];
+    ssize_t stdin_length = 0;
+    if (from_stdin) {
+        do {
+            stdin_length = read(STDIN_FILENO, stdin_packet + 1,
+                                sizeof(stdin_packet) - 1);
+        } while (stdin_length < 0 && errno == EINTR);
+        if (stdin_length < 0) {
+            fprintf(stderr, "perch: cannot read stdin: %s\n", strerror(errno));
+            return EXIT_FAILURE;
+        }
+        if (stdin_length == 0) {
+            fprintf(stderr, "perch: cannot open stdin: empty stream\n");
+            return EXIT_FAILURE;
+        }
+        stdin_packet[0] = 1;
+    }
+
     const int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
     struct sockaddr_un address;
     if (fd < 0 || connect(fd, (struct sockaddr *)&address,
@@ -907,26 +925,25 @@ static int run_client(int argc, char **argv)
     }
 
     if (from_stdin) {
-        uint8_t packet[4097];
         for (;;) {
-            ssize_t length;
+            if (send_packet(fd, stdin_packet, (size_t)stdin_length + 1) < 0) {
+                close(fd);
+                return EXIT_FAILURE;
+            }
+            if (stdin_length == 0) {
+                break;
+            }
             do {
-                length = read(STDIN_FILENO, packet + 1, sizeof(packet) - 1);
-            } while (length < 0 && errno == EINTR);
-            if (length < 0) {
+                stdin_length = read(STDIN_FILENO, stdin_packet + 1,
+                                    sizeof(stdin_packet) - 1);
+            } while (stdin_length < 0 && errno == EINTR);
+            if (stdin_length < 0) {
                 fprintf(stderr, "perch: cannot read stdin: %s\n",
                         strerror(errno));
                 close(fd);
                 return EXIT_FAILURE;
             }
-            packet[0] = length == 0 ? 0 : 1;
-            if (send_packet(fd, packet, (size_t)length + 1) < 0) {
-                close(fd);
-                return EXIT_FAILURE;
-            }
-            if (length == 0) {
-                break;
-            }
+            stdin_packet[0] = stdin_length == 0 ? 0 : 1;
         }
     }
     for (int index = 1; !from_stdin && index < argc; ++index) {
