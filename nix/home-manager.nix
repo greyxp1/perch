@@ -1,19 +1,11 @@
 {self}: {
   config,
   lib,
-  pkgs,
   ...
 }: let
   cfg = config.programs.perch;
 in {
-  options.programs.perch = {
-    enable = lib.mkEnableOption "the Perch Wayland image viewer";
-    package = lib.mkOption {
-      type = lib.types.package;
-      default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
-      description = "Perch package to use.";
-    };
-  };
+  imports = [(import ./options.nix {inherit self;})];
 
   config = lib.mkIf cfg.enable {
     home.packages = [cfg.package];
@@ -25,7 +17,8 @@ in {
         PartOf = ["graphical-session.target"];
       };
       Service = {
-        ExecStart = "${cfg.package}/bin/perch --daemon";
+        Type = "exec";
+        ExecStart = "${lib.getExe cfg.package} --daemon";
         Restart = "on-failure";
         RestartSec = 1;
       };

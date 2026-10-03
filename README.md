@@ -29,13 +29,20 @@ Or pipe an image through standard input:
 cat image.png | perch --stdin
 ```
 
-## Home Manager
+## Nix
 
-Import `perch.homeModules.default`, then enable the program:
+Add Perch to your flake inputs:
 
 ```nix
-{
-  imports = [inputs.perch.homeModules.default];
+inputs.perch.url = "github:greyxp1/perch";
+```
+
+Import and enable the module in your NixOS or Home Manager configuration:
+
+```nix
+{inputs, ...}: {
+  # Use homeModules.default for Home Manager.
+  imports = [inputs.perch.nixosModules.default];
   programs.perch.enable = true;
 }
 ```

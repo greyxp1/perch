@@ -3,27 +3,39 @@
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
-  outputs = {self, nixpkgs, ...}: let
+  outputs = {
+    self,
+    nixpkgs,
+    ...
+  }: let
     systems = [
       "aarch64-linux"
       "x86_64-linux"
     ];
-    forAllSystems = nixpkgs.lib.genAttrs systems;
+    eachSystem = f:
+      nixpkgs.lib.genAttrs systems
+      (system: f nixpkgs.legacyPackages.${system});
   in {
-    homeModules.default = import ./home-module.nix {inherit self;};
+    homeModules.default = import ./nix/home-manager.nix {inherit self;};
+    nixosModules.default = import ./nix/nixos.nix {inherit self;};
 
-    packages = forAllSystems (system: let
-      pkgs = import nixpkgs {inherit system;};
-      perch = pkgs.callPackage ./package.nix {};
+    packages = eachSystem (pkgs: let
+      perch = pkgs.callPackage ./nix/package.nix {};
     in {
       inherit perch;
       default = perch;
     });
 
-    apps = forAllSystems (system: let
+    devShells = eachSystem (pkgs: {
+      default = pkgs.mkShell {
+        inputsFrom = [self.packages.${pkgs.stdenv.hostPlatform.system}.perch];
+      };
+    });
+
+    apps = eachSystem (pkgs: let
       perch = {
         type = "app";
-        program = "${nixpkgs.lib.getExe self.packages.${system}.default}";
+        program = nixpkgs.lib.getExe self.packages.${pkgs.stdenv.hostPlatform.system}.perch;
       };
     in {
       inherit perch;
