@@ -63,6 +63,7 @@ struct pin {
     struct wp_viewport *viewport;
     struct wl_buffer *buffer;
     double zoom;
+    double min_zoom;
     int image_width;
     int image_height;
     int presented;
@@ -340,6 +341,7 @@ static struct pin *create_pin(struct app *app, GdkPixbuf *loaded,
     const double width_scale = output_width * 0.9 / pin->image_width;
     const double height_scale = output_height * 0.9 / pin->image_height;
     pin->zoom = fmin(1.0, fmin(width_scale, height_scale));
+    pin->min_zoom = fmin(0.05, pin->zoom);
 
     pin->surface = wl_compositor_create_surface(app->compositor);
     if (pin->surface) {
@@ -481,7 +483,7 @@ static void pointer_axis(void *data, struct wl_pointer *pointer, uint32_t time,
     }
 
     const double steps = -wl_fixed_to_double(value) / 15.0;
-    pin->zoom = fmin(8.0, fmax(0.05, pin->zoom * pow(1.1, steps)));
+    pin->zoom = fmin(8.0, fmax(pin->min_zoom, pin->zoom * pow(1.1, steps)));
     update_pin_size(pin);
 }
 
