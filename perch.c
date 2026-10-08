@@ -14,7 +14,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
-#include <sys/time.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -28,8 +28,18 @@
 #define IPC_MAGIC 0x50455243u
 #define MAX_PATHS 4096u
 #define MAX_PATH_SIZE PATH_MAX
+#define MAX_CLIENTS 16
 
 struct app;
+
+struct client {
+    int fd;
+    int header_received;
+    uint32_t path_count;
+    uint32_t paths_received;
+    char **paths;
+    GdkPixbufLoader *loader;
+};
 
 struct output {
     struct output *next;
@@ -364,7 +374,20 @@ static struct pin *create_pin(struct app *app, GdkPixbuf *loaded,
 static struct pin *open_pin(struct app *app, const char *path)
 {
     GError *error = NULL;
-    GdkPixbuf *loaded = gdk_pixbuf_new_from_file(path, &error);
+    const int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+    struct stat metadata;
+    if (fd < 0 || fstat(fd, &metadata) < 0 || !S_ISREG(metadata.st_mode)) {
+        fprintf(stderr, "perch: cannot open %s: expected a regular image file\n",
+                path);
+        if (fd >= 0) {
+            close(fd);
+        }
+        return NULL;
+    }
+    char fd_path[64];
+    snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", fd);
+    GdkPixbuf *loaded = gdk_pixbuf_new_from_file(fd_path, &error);
+    close(fd);
     if (!loaded) {
         fprintf(stderr, "perch: cannot open %s: %s\n", path,
                 error ? error->message : "unsupported image");
@@ -374,56 +397,6 @@ static struct pin *open_pin(struct app *app, const char *path)
 
     struct pin *pin = create_pin(app, loaded, path);
     g_object_unref(loaded);
-    return pin;
-}
-
-static struct pin *open_stdin(struct app *app, int client)
-{
-    GdkPixbufLoader *loader = gdk_pixbuf_loader_new();
-    GError *error = NULL;
-    uint8_t packet[4097];
-    int complete = 0;
-
-    for (;;) {
-        const ssize_t length = receive_packet(client, packet, sizeof(packet));
-        if (length <= 0) {
-            fprintf(stderr, "perch: cannot open stdin: %s\n",
-                    length == 0 ? "client disconnected" : strerror(errno));
-            break;
-        }
-        if ((size_t)length > sizeof(packet)) {
-            fprintf(stderr, "perch: invalid stdin stream\n");
-            break;
-        }
-        if (packet[0] == 0) {
-            if (length != 1) {
-                fprintf(stderr, "perch: invalid stdin stream\n");
-                break;
-            }
-            complete = gdk_pixbuf_loader_close(loader, &error);
-            break;
-        }
-        if (packet[0] != 1 || length == 1) {
-            fprintf(stderr, "perch: invalid stdin stream\n");
-            break;
-        }
-        if (!gdk_pixbuf_loader_write(
-                loader, packet + 1, (gsize)length - 1, &error)) {
-            break;
-        }
-    }
-
-    struct pin *pin = NULL;
-    if (complete) {
-        GdkPixbuf *loaded = gdk_pixbuf_loader_get_pixbuf(loader);
-        if (loaded) {
-            pin = create_pin(app, loaded, "stdin");
-        }
-    } else if (error) {
-        fprintf(stderr, "perch: cannot open stdin: %s\n", error->message);
-    }
-    g_clear_error(&error);
-    g_object_unref(loader);
     return pin;
 }
 
@@ -727,41 +700,96 @@ static const struct wl_registry_listener registry_listener = {
     .global_remove = registry_global_remove,
 };
 
-static int handle_client(struct app *app, int client)
+static void close_client(struct client *client)
 {
-    uint32_t header[2];
-    if (receive_packet(client, header, sizeof(header)) != (ssize_t)sizeof(header) ||
-        header[0] != IPC_MAGIC ||
-        header[1] > MAX_PATHS) {
+    close(client->fd);
+    for (uint32_t index = 0; index < client->paths_received; ++index) {
+        free(client->paths[index]);
+    }
+    free(client->paths);
+    if (client->loader) {
+        gdk_pixbuf_loader_close(client->loader, NULL);
+        g_object_unref(client->loader);
+    }
+    *client = (struct client){ .fd = -1 };
+}
+
+static int read_client(struct app *app, struct client *client)
+{
+    if (!client->header_received) {
+        uint32_t header[2];
+        if (receive_packet(client->fd, header, sizeof(header)) !=
+                (ssize_t)sizeof(header) ||
+            header[0] != IPC_MAGIC || header[1] > MAX_PATHS) {
+            return -1;
+        }
+        client->path_count = header[1];
+        if (client->path_count == 0) {
+            client->loader = gdk_pixbuf_loader_new();
+        } else {
+            client->paths = calloc(client->path_count, sizeof(*client->paths));
+            if (!client->paths) {
+                return -1;
+            }
+        }
+        client->header_received = 1;
+        return 0;
+    }
+
+    if (client->loader) {
+        uint8_t packet[4097];
+        const ssize_t length = receive_packet(client->fd, packet, sizeof(packet));
+        if (length <= 0 || (size_t)length > sizeof(packet)) {
+            return -1;
+        }
+        GError *error = NULL;
+        int success;
+        if (packet[0] == 1 && length > 1) {
+            success = gdk_pixbuf_loader_write(
+                client->loader, packet + 1, (gsize)length - 1, &error);
+        } else if (packet[0] == 0 && length == 1) {
+            success = gdk_pixbuf_loader_close(client->loader, &error);
+        } else {
+            return -1;
+        }
+        if (!success) {
+            fprintf(stderr, "perch: cannot open stdin: %s\n",
+                    error ? error->message : "unsupported image");
+            g_clear_error(&error);
+            return -1;
+        }
+        if (packet[0] == 1) {
+            return 0;
+        }
+        GdkPixbuf *loaded = gdk_pixbuf_loader_get_pixbuf(client->loader);
+        return loaded && create_pin(app, loaded, "stdin") ? 1 : -1;
+    }
+
+    char path[MAX_PATH_SIZE + 1];
+    const ssize_t length = receive_packet(client->fd, path, sizeof(path));
+    if (length <= 1 || (size_t)length > sizeof(path) ||
+        path[length - 1] != '\0' || memchr(path, '\0', (size_t)length - 1)) {
         return -1;
+    }
+    char *copy = strdup(path);
+    if (!copy) {
+        return -1;
+    }
+    client->paths[client->paths_received++] = copy;
+    if (client->paths_received < client->path_count) {
+        return 0;
     }
 
     struct pin *const previous_pins = app->pins;
-    int status = 0;
-    if (header[1] == 0) {
-        status = open_stdin(app, client) ? 0 : -1;
-    } else {
-        for (uint32_t index = 0; index < header[1]; ++index) {
-            char path[MAX_PATH_SIZE + 1];
-            const ssize_t length = receive_packet(client, path, sizeof(path));
-            if (length <= 1 || (size_t)length > sizeof(path) ||
-                path[length - 1] != '\0' ||
-                memchr(path, '\0', (size_t)length - 1)) {
-                status = -1;
-                break;
+    for (uint32_t index = 0; index < client->path_count; ++index) {
+        if (!open_pin(app, client->paths[index])) {
+            while (app->pins != previous_pins) {
+                destroy_pin(app->pins);
             }
-            if (!open_pin(app, path)) {
-                status = -1;
-            }
+            return -1;
         }
     }
-
-    while (status != 0 && app->pins != previous_pins) {
-        destroy_pin(app->pins);
-    }
-    const uint8_t response = status == 0 ? 0 : 1;
-    send_packet(client, &response, sizeof(response));
-    return status;
+    return 1;
 }
 
 static int create_server(void)
@@ -771,7 +799,7 @@ static int create_server(void)
     struct sockaddr_un address;
     if (fd < 0 || bind(fd, (struct sockaddr *)&address,
                        socket_address(&address)) < 0 ||
-        listen(fd, 16) < 0) {
+        listen(fd, MAX_CLIENTS) < 0) {
         if (fd >= 0) {
             close(fd);
         }
@@ -820,6 +848,10 @@ static int run_daemon(void)
         return EXIT_FAILURE;
     }
 
+    struct client clients[MAX_CLIENTS];
+    for (size_t index = 0; index < ARRAY_LEN(clients); ++index) {
+        clients[index] = (struct client){ .fd = -1 };
+    }
     const int display_fd = wl_display_get_fd(app.display);
     for (;;) {
         if (wl_display_dispatch_pending(app.display) < 0) {
@@ -830,13 +862,25 @@ static int run_daemon(void)
             break;
         }
 
-        struct pollfd descriptors[] = {
+        size_t client_slot = 0;
+        while (client_slot < ARRAY_LEN(clients) && clients[client_slot].fd >= 0) {
+            ++client_slot;
+        }
+        struct pollfd descriptors[2 + MAX_CLIENTS] = {
             {
                 .fd = display_fd,
                 .events = POLLIN | (flush_result < 0 ? POLLOUT : 0),
             },
-            { .fd = app.server_fd, .events = POLLIN },
+            {
+                .fd = client_slot < ARRAY_LEN(clients) ? app.server_fd : -1,
+                .events = POLLIN,
+            },
         };
+        for (size_t index = 0; index < ARRAY_LEN(clients); ++index) {
+            descriptors[index + 2] = (struct pollfd){
+                .fd = clients[index].fd, .events = POLLIN,
+            };
+        }
         if (poll(descriptors, ARRAY_LEN(descriptors), -1) < 0) {
             if (errno == EINTR) {
                 continue;
@@ -851,25 +895,29 @@ static int run_daemon(void)
             wl_display_dispatch(app.display) < 0) {
             break;
         }
+        for (size_t index = 0; index < ARRAY_LEN(clients); ++index) {
+            const short events = descriptors[index + 2].revents;
+            if (!(events & (POLLIN | POLLERR | POLLHUP | POLLNVAL))) {
+                continue;
+            }
+            struct client *client = &clients[index];
+            const int status = (events & (POLLERR | POLLNVAL)) ? -1 :
+                read_client(&app, client);
+            if (status != 0) {
+                const uint8_t response = status > 0 ? 0 : 1;
+                send_packet(client->fd, &response, sizeof(response));
+                close_client(client);
+            }
+        }
         if (descriptors[1].revents & POLLIN) {
-            for (;;) {
-                const int client = accept4(
-                    app.server_fd, NULL, NULL, SOCK_CLOEXEC);
-                if (client < 0) {
-                    if (errno == EINTR) {
-                        continue;
-                    }
-                    break;
+            const int fd = accept4(
+                app.server_fd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
+            if (fd >= 0) {
+                if (client_is_local(fd)) {
+                    clients[client_slot].fd = fd;
+                } else {
+                    close(fd);
                 }
-                if (!client_is_local(client)) {
-                    close(client);
-                    continue;
-                }
-                const struct timeval timeout = { .tv_sec = 2 };
-                setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
-                           &timeout, sizeof(timeout));
-                handle_client(&app, client);
-                close(client);
             }
         }
     }
