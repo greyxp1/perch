@@ -41,6 +41,14 @@ struct client {
     GdkPixbufLoader *loader;
 };
 
+struct seat {
+    struct seat *next;
+    struct wl_seat *wl;
+    struct wl_pointer *pointer;
+    struct pin *pointer_pin;
+    uint32_t name;
+};
+
 struct output {
     struct output *next;
     struct wl_output *wl;
@@ -77,14 +85,12 @@ struct app {
     struct wl_registry *registry;
     struct wl_compositor *compositor;
     struct wl_shm *shm;
-    struct wl_seat *seat;
-    struct wl_pointer *pointer;
+    struct seat *seats;
     struct xdg_wm_base *wm_base;
     struct wp_viewporter *viewporter;
     struct zxdg_output_manager_v1 *output_manager;
     struct output *outputs;
     struct pin *pins;
-    struct pin *pointer_pin;
     uint32_t shm_format;
     int server_fd;
 };
@@ -415,8 +421,10 @@ static void destroy_pin(struct pin *pin)
     if (*link) {
         *link = pin->next;
     }
-    if (app->pointer_pin == pin) {
-        app->pointer_pin = NULL;
+    for (struct seat *seat = app->seats; seat; seat = seat->next) {
+        if (seat->pointer_pin == pin) {
+            seat->pointer_pin = NULL;
+        }
     }
     if (pin->viewport) {
         wp_viewport_destroy(pin->viewport);
@@ -439,18 +447,17 @@ static void destroy_pin(struct pin *pin)
 static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t serial,
                           struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y)
 {
-    struct app *app = data;
-    app->pointer_pin = wl_surface_get_user_data(surface);
+    ((struct seat *)data)->pointer_pin = wl_surface_get_user_data(surface);
 }
 
 static void pointer_leave(void *data, struct wl_pointer *pointer, uint32_t serial,
                           struct wl_surface *surface)
 {
-    struct app *app = data;
-    if (app->pointer_pin && app->pointer_pin->dirty) {
-        render_pin(app->pointer_pin);
+    struct seat *seat = data;
+    if (seat->pointer_pin && seat->pointer_pin->dirty) {
+        render_pin(seat->pointer_pin);
     }
-    app->pointer_pin = NULL;
+    seat->pointer_pin = NULL;
 }
 
 static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time,
@@ -461,13 +468,13 @@ static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time
 static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t serial,
                            uint32_t time, uint32_t button, uint32_t state)
 {
-    struct app *app = data;
-    struct pin *pin = app->pointer_pin;
+    struct seat *seat = data;
+    struct pin *pin = seat->pointer_pin;
     if (!pin || state != WL_POINTER_BUTTON_STATE_PRESSED) {
         return;
     }
     if (button == BTN_LEFT) {
-        xdg_toplevel_move(pin->toplevel, app->seat, serial);
+        xdg_toplevel_move(pin->toplevel, seat->wl, serial);
     } else if (button == BTN_RIGHT) {
         destroy_pin(pin);
     }
@@ -476,8 +483,7 @@ static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t seri
 static void pointer_axis(void *data, struct wl_pointer *pointer, uint32_t time,
                          uint32_t axis, wl_fixed_t value)
 {
-    struct app *app = data;
-    struct pin *pin = app->pointer_pin;
+    struct pin *pin = ((struct seat *)data)->pointer_pin;
     if (!pin || axis != WL_POINTER_AXIS_VERTICAL_SCROLL) {
         return;
     }
@@ -489,7 +495,7 @@ static void pointer_axis(void *data, struct wl_pointer *pointer, uint32_t time,
 
 static void pointer_frame(void *data, struct wl_pointer *pointer)
 {
-    struct pin *pin = ((struct app *)data)->pointer_pin;
+    struct pin *pin = ((struct seat *)data)->pointer_pin;
     if (pin && pin->dirty) {
         render_pin(pin);
     }
@@ -522,16 +528,17 @@ static const struct wl_pointer_listener pointer_listener = {
     .axis_discrete = pointer_axis_discrete,
 };
 
-static void seat_capabilities(void *data, struct wl_seat *seat,
+static void seat_capabilities(void *data, struct wl_seat *wl_seat,
                               uint32_t capabilities)
 {
-    struct app *app = data;
-    if ((capabilities & WL_SEAT_CAPABILITY_POINTER) && !app->pointer) {
-        app->pointer = wl_seat_get_pointer(seat);
-        wl_pointer_add_listener(app->pointer, &pointer_listener, app);
-    } else if (!(capabilities & WL_SEAT_CAPABILITY_POINTER) && app->pointer) {
-        wl_pointer_release(app->pointer);
-        app->pointer = NULL;
+    struct seat *seat = data;
+    if ((capabilities & WL_SEAT_CAPABILITY_POINTER) && !seat->pointer) {
+        seat->pointer = wl_seat_get_pointer(wl_seat);
+        wl_pointer_add_listener(seat->pointer, &pointer_listener, seat);
+    } else if (!(capabilities & WL_SEAT_CAPABILITY_POINTER) && seat->pointer) {
+        wl_pointer_release(seat->pointer);
+        seat->pointer = NULL;
+        seat->pointer_pin = NULL;
     }
 }
 
@@ -650,8 +657,15 @@ static void registry_global(void *data, struct wl_registry *registry,
         app->shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
         wl_shm_add_listener(app->shm, &shm_listener, app);
     } else if (strcmp(interface, wl_seat_interface.name) == 0 && version >= 5) {
-        app->seat = wl_registry_bind(registry, name, &wl_seat_interface, 5);
-        wl_seat_add_listener(app->seat, &seat_listener, app);
+        struct seat *seat = calloc(1, sizeof(*seat));
+        if (!seat) {
+            return;
+        }
+        seat->name = name;
+        seat->wl = wl_registry_bind(registry, name, &wl_seat_interface, 5);
+        seat->next = app->seats;
+        app->seats = seat;
+        wl_seat_add_listener(seat->wl, &seat_listener, seat);
     } else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
         app->wm_base = wl_registry_bind(
             registry, name, &xdg_wm_base_interface, 1);
@@ -682,7 +696,22 @@ static void registry_global(void *data, struct wl_registry *registry,
 static void registry_global_remove(void *data, struct wl_registry *registry,
                                    uint32_t name)
 {
-    struct output **link = &((struct app *)data)->outputs;
+    struct app *app = data;
+    struct seat **seat_link = &app->seats;
+    while (*seat_link && (*seat_link)->name != name) {
+        seat_link = &(*seat_link)->next;
+    }
+    if (*seat_link) {
+        struct seat *seat = *seat_link;
+        *seat_link = seat->next;
+        if (seat->pointer) {
+            wl_pointer_release(seat->pointer);
+        }
+        wl_seat_release(seat->wl);
+        free(seat);
+        return;
+    }
+    struct output **link = &app->outputs;
     while (*link && (*link)->name != name) {
         link = &(*link)->next;
     }
@@ -837,7 +866,7 @@ static int run_daemon(void)
     attach_xdg_outputs(&app);
     wl_display_roundtrip(app.display);
 
-    if (!app.compositor || !app.shm || !app.seat || !app.wm_base ||
+    if (!app.compositor || !app.shm || !app.seats || !app.wm_base ||
         !app.viewporter) {
         fprintf(stderr, "perch: required Wayland protocols are unavailable\n");
         return EXIT_FAILURE;
