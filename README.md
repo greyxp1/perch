@@ -2,6 +2,7 @@
 
 `perch` is a small native Wayland image viewer for keeping reference images
 on screen. It uses one resident daemon for any number of independent windows.
+Your compositor must support xdg-shell v4 and viewporter.
 
 ## Controls
 
@@ -28,6 +29,8 @@ Or pipe an image through standard input:
 ```sh
 cat image.png | perch --stdin
 ```
+
+Standard input is limited to 256 MiB.
 
 ## Nix
 
