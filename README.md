@@ -9,6 +9,11 @@ Your compositor must support xdg-shell v4 and viewporter.
 - Left drag: move the window
 - Mouse wheel: resize the window
 - Right click: close the window
+- Left/right arrows: previous/next image
+- Space: play or pause animation
+- Tab: toggle inspection, where left drag pans and the wheel zooms
+- Home: fit the image
+- End: show at original size
 
 ## Usage
 
@@ -30,7 +35,13 @@ Or pipe an image through standard input:
 cat image.png | perch --stdin
 ```
 
-Standard input is limited to 256 MiB.
+Standard input and each decoded image are limited to 256 MiB. Perch loads images
+in the background and keeps one next decoded image up to 64 MiB. Animation is
+opt-in, with a 16 MiB frame limit.
+
+Supported tiled TIFFs read only the visible region and can use reduced-resolution
+images in the main TIFF directory chain. Large tiled images without an overview
+open in inspection mode. Other formats decode the whole image.
 
 ## Nix
 

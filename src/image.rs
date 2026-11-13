@@ -7,7 +7,7 @@ use fast_image_resize::{
 use image::{
     DynamicImage, GenericImageView, ImageDecoder, ImageFormat, ImageReader, metadata::Orientation,
 };
-use memmap2::{MmapMut, MmapOptions};
+use memmap2::{Mmap, MmapMut, MmapOptions};
 use nix::{
     fcntl::{FcntlArg, SealFlag, fcntl},
     sys::memfd::{MFdFlags, memfd_create},
@@ -25,13 +25,14 @@ pub struct Pixels {
     pub mapping: MmapMut,
     pub width: i32,
     pub height: i32,
+    pub orientation: Orientation,
 }
 impl Pixels {
-    fn new(width: i32, height: i32) -> Result<Self> {
+    pub fn new(width: i32, height: i32) -> Result<Self> {
         let size = width
             .checked_mul(height)
             .and_then(|n| n.checked_mul(4))
-            .filter(|_| width > 0 && height > 0)
+            .filter(|n| width > 0 && height > 0 && *n <= 256 * 1024 * 1024)
             .ok_or("image is too large")?;
         let file = File::from(memfd_create(
             c"perch",
@@ -40,9 +41,7 @@ impl Pixels {
         file.set_len(size as u64)?;
         fcntl(
             &file,
-            FcntlArg::F_ADD_SEALS(
-                SealFlag::F_SEAL_GROW | SealFlag::F_SEAL_SHRINK | SealFlag::F_SEAL_SEAL,
-            ),
+            FcntlArg::F_ADD_SEALS(SealFlag::F_SEAL_GROW | SealFlag::F_SEAL_SHRINK),
         )?;
         // This private sealed file cannot shrink while mapped.
         let mapping = unsafe { MmapOptions::new().len(size as usize).map_mut(&file)? };
@@ -51,9 +50,14 @@ impl Pixels {
             mapping,
             width,
             height,
+            orientation: Orientation::NoTransforms,
         })
     }
-    pub fn load(mut reader: impl BufRead + Seek, path: Option<PathBuf>) -> Result<Self> {
+    pub fn load(
+        mut reader: impl BufRead + Seek,
+        path: Option<PathBuf>,
+        limit: usize,
+    ) -> Result<Self> {
         let format = ImageReader::new(&mut reader)
             .with_guessed_format()?
             .format()
@@ -63,7 +67,12 @@ impl Pixels {
             });
         match format {
             Some(ImageFormat::Png) => Self::png(reader),
-            Some(format) => Self::raster(decode(reader, format)?),
+            Some(format) => {
+                let (image, orientation) = decode(reader, format)?;
+                let mut pixels = Self::raster(image)?;
+                pixels.orientation = orientation;
+                Ok(pixels)
+            }
             None => {
                 static FONTS: OnceLock<Arc<resvg::usvg::fontdb::Database>> = OnceLock::new();
                 let mut bytes = Vec::new();
@@ -96,6 +105,9 @@ impl Pixels {
                 });
                 let tree = resvg::usvg::Tree::from_data(&bytes, &options)?;
                 let size = tree.size().to_int_size();
+                if u64::from(size.width()) * u64::from(size.height()) * 4 > limit as u64 {
+                    return Err("SVG exceeds the decoded memory budget".into());
+                }
                 let mut pixels = Self::new(size.width().try_into()?, size.height().try_into()?)?;
                 let mut pixmap = resvg::tiny_skia::PixmapMut::from_bytes(
                     &mut pixels.mapping,
@@ -130,7 +142,9 @@ impl Pixels {
                     .ok_or("invalid PNG size")?,
             );
             image.apply_orientation(orientation);
-            return Self::raster(image);
+            let mut pixels = Self::raster(image)?;
+            pixels.orientation = orientation;
+            return Ok(pixels);
         }
         MulDiv::default().multiply_alpha_inplace(&mut Image::from_slice_u8(
             info.width,
@@ -140,7 +154,7 @@ impl Pixels {
         )?)?;
         Ok(pixels)
     }
-    fn raster(image: DynamicImage) -> Result<Self> {
+    pub fn raster(image: DynamicImage) -> Result<Self> {
         let (width, height) = image.dimensions();
         let mut pixels = Self::new(width.try_into()?, height.try_into()?)?;
         if let DynamicImage::ImageRgb8(rgb) = image {
@@ -156,7 +170,10 @@ impl Pixels {
     }
 }
 
-fn decode(mut reader: impl BufRead + Seek, format: ImageFormat) -> Result<DynamicImage> {
+fn decode(
+    mut reader: impl BufRead + Seek,
+    format: ImageFormat,
+) -> Result<(DynamicImage, Orientation)> {
     if format == ImageFormat::Tiff {
         let mut decoder = tiff::decoder::Decoder::new(&mut reader)?;
         if decoder.colortype()? == tiff::ColorType::RGB(8)
@@ -175,7 +192,7 @@ fn decode(mut reader: impl BufRead + Seek, format: ImageFormat) -> Result<Dynami
                     image::RgbImage::from_raw(width, height, bytes).ok_or("invalid TIFF size")?,
                 );
                 image.apply_orientation(orientation);
-                return Ok(image);
+                return Ok((image, orientation));
             }
             return Err("invalid TIFF samples".into());
         }
@@ -186,7 +203,7 @@ fn decode(mut reader: impl BufRead + Seek, format: ImageFormat) -> Result<Dynami
     let orientation = decoder.orientation()?;
     let mut image = DynamicImage::from_decoder(decoder)?;
     image.apply_orientation(orientation);
-    Ok(image)
+    Ok((image, orientation))
 }
 fn expand_rgb(source: &[u8], target: &mut [u8]) {
     #[cfg(target_arch = "x86_64")]
@@ -236,5 +253,36 @@ unsafe fn expand_rgb_ssse3(source: &[u8], target: &mut [u8]) {
         .zip(target[write..].as_chunks_mut::<4>().0)
     {
         target.copy_from_slice(&[source[0], source[1], source[2], 255]);
+    }
+}
+
+pub struct Frame {
+    pub file: File,
+    pub width: i32,
+    pub height: i32,
+}
+impl Frame {
+    pub fn bytes(&self) -> usize {
+        self.width as usize * self.height as usize * 4
+    }
+    pub fn map(&self) -> Result<Mmap> {
+        // Frame lengths are sealed and Perch drops writable mappings before sharing.
+        Ok(unsafe { MmapOptions::new().map(&self.file)? })
+    }
+}
+impl Pixels {
+    pub fn freeze(mut self, swap: bool) -> Result<Arc<Frame>> {
+        if swap {
+            for pixel in self.mapping.as_chunks_mut::<4>().0 {
+                pixel.swap(0, 2);
+            }
+        }
+        drop(self.mapping);
+        fcntl(&self.file, FcntlArg::F_ADD_SEALS(SealFlag::F_SEAL_SEAL))?;
+        Ok(Arc::new(Frame {
+            file: self.file,
+            width: self.width,
+            height: self.height,
+        }))
     }
 }
