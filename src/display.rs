@@ -752,7 +752,7 @@ impl Dispatch<xdg_surface::XdgSurface, u64> for App {
     ) {
         if let xdg_surface::Event::Configure { serial } = event {
             surface.ack_configure(serial);
-            if let Some(pin) = state.pins.get_mut(id) {
+            if let Some(pin) = state.pins.get_mut(id).filter(|pin| !pin.configured) {
                 pin.configured = true;
                 pin.constraints();
                 pin.render_needed = true;
@@ -964,6 +964,7 @@ impl Dispatch<wl_surface::WlSurface, u64> for App {
     ) {
         if let wl_surface::Event::PreferredBufferScale { factor } = event
             && let Some(pin) = state.pins.get_mut(id)
+            && pin.scale != factor.max(1)
         {
             pin.scale = factor.max(1);
             pin.invalidate();

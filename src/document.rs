@@ -12,11 +12,11 @@ use image::{
     metadata::{LoopCount, Orientation},
 };
 use std::{
-    fs::OpenOptions,
-    io::{BufRead, BufReader, Cursor, Seek},
+    fs::{File, OpenOptions},
+    io::{BufRead, BufReader, Cursor, Seek, Write},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tiff::{
@@ -41,8 +41,8 @@ pub enum Input {
     Bytes(Arc<Vec<u8>>),
 }
 impl Input {
-    fn reader(&self) -> Result<Box<dyn Reader + Send>> {
-        Ok(match self {
+    fn file(&self) -> Result<File> {
+        match self {
             Self::Path(path) => {
                 let file = OpenOptions::new()
                     .read(true)
@@ -51,8 +51,20 @@ impl Input {
                 if !file.metadata()?.is_file() {
                     return Err("expected a regular image file".into());
                 }
-                Box::new(BufReader::new(file))
+                Ok(file)
             }
+            Self::Bytes(bytes) => {
+                use nix::sys::memfd::{MFdFlags, memfd_create};
+                let mut file = File::from(memfd_create(c"perch-input", MFdFlags::MFD_CLOEXEC)?);
+                file.write_all(bytes)?;
+                file.rewind()?;
+                Ok(file)
+            }
+        }
+    }
+    fn reader(&self) -> Result<Box<dyn Reader + Send>> {
+        Ok(match self {
+            Self::Path(_) => Box::new(BufReader::new(self.file()?)),
             Self::Bytes(bytes) => Box::new(Cursor::new(SharedBytes(bytes.clone()))),
         })
     }
@@ -69,7 +81,7 @@ pub struct Source {
     pub size: (u32, u32),
     pub animated: bool,
     orientation: Orientation,
-    pub frame: Option<Arc<Frame>>,
+    pub frame: Option<Mutex<Arc<Frame>>>,
     tiles: Option<Vec<Level>>,
 }
 struct Level {
@@ -138,31 +150,78 @@ impl Source {
                     tiles: Some(levels),
                 }));
             }
+            let size = tiff.dimensions()?;
+            if u64::from(size.0) * u64::from(size.1) >= 1_000_000
+                && tiff.get_chunk_type() == ChunkType::Strip
+                && tiff.colortype()? == ColorType::RGB(8)
+                && tiff
+                    .find_tag_unsigned::<u16>(Tag::PlanarConfiguration)?
+                    .unwrap_or(1)
+                    == 1
+            {
+                if u64::from(size.0) * u64::from(size.1) * 4 > limit as u64 {
+                    return Err("image exceeds the decoded memory budget".into());
+                }
+                let rows = tiff.chunk_dimensions().1.min(size.1);
+                let orientation = tiff
+                    .find_tag_unsigned::<u16>(Tag::Orientation)?
+                    .and_then(|n| Orientation::from_exif(n.try_into().ok()?))
+                    .unwrap_or(Orientation::NoTransforms);
+                let compression = tiff
+                    .find_tag_unsigned::<u16>(Tag::Compression)?
+                    .unwrap_or(1);
+                drop(tiff);
+                drop(reader);
+                let pixels = if crate::image::native_tiff(compression) {
+                    Pixels::tiff(input.file()?, size).or_else(|_| strips(&input, size, rows))?
+                } else {
+                    strips(&input, size, rows)?
+                }
+                .orient(orientation)?;
+                return Self::pixels(input, pixels, false, swap);
+            }
             drop(tiff);
             reader.rewind()?;
         }
-        if let Some(format) = format {
-            let decoder = ImageReader::with_format(&mut reader, format).into_decoder()?;
-            let (w, h) = decoder.dimensions();
+        let dimensions = |(w, h): (u32, u32)| -> Result<()> {
             if u64::from(w) * u64::from(h) * 4 > limit as u64 {
                 return Err("image exceeds the decoded memory budget".into());
             }
-            drop(decoder);
-            reader.rewind()?;
-        }
+            Ok(())
+        };
         let animated = match format {
-            Some(ImageFormat::Gif) => true,
-            Some(ImageFormat::WebP) => {
-                image::codecs::webp::WebPDecoder::new(&mut reader)?.has_animation()
-            }
             Some(ImageFormat::Png) => {
-                image::codecs::png::PngDecoder::new(&mut reader)?.is_apng()?
+                let decoder = image::codecs::png::PngDecoder::with_limits(
+                    &mut reader,
+                    image::Limits::default(),
+                )?;
+                dimensions(decoder.dimensions())?;
+                decoder.is_apng()?
             }
-            _ => false,
+            Some(ImageFormat::WebP) => {
+                let decoder = image::codecs::webp::WebPDecoder::new(&mut reader)?;
+                dimensions(decoder.dimensions())?;
+                decoder.has_animation()
+            }
+            Some(format) => {
+                let decoder = ImageReader::with_format(&mut reader, format).into_decoder()?;
+                dimensions(decoder.dimensions())?;
+                format == ImageFormat::Gif
+            }
+            None => false,
         };
         reader.rewind()?;
         let pixels = Pixels::load(reader, input.path().map(Path::to_path_buf), limit)?;
-        let size = (pixels.width as u32, pixels.height as u32);
+        Self::pixels(input, pixels, animated, swap)
+    }
+    fn pixels(input: Input, pixels: Pixels, animated: bool, swap: bool) -> Result<Arc<Self>> {
+        let size = pixels.original_size;
+        let input = match input {
+            Input::Bytes(_) if !animated && size == (pixels.width as u32, pixels.height as u32) => {
+                Input::Bytes(Arc::default())
+            }
+            input => input,
+        };
         let orientation = pixels.orientation;
         let frame = pixels.freeze(swap)?;
         Ok(Arc::new(Self {
@@ -170,7 +229,7 @@ impl Source {
             size,
             animated,
             orientation,
-            frame: Some(frame),
+            frame: Some(Mutex::new(frame)),
             tiles: None,
         }))
     }
@@ -178,7 +237,7 @@ impl Source {
         self.input.path()
     }
     pub fn bytes(&self) -> usize {
-        self.frame.as_ref().map_or(0, |f| f.bytes())
+        self.frame.as_ref().map_or(0, |f| f.lock().unwrap().bytes())
     }
     pub fn region_only(&self) -> bool {
         self.tiles.as_ref().is_some_and(|levels| {
@@ -204,9 +263,8 @@ impl Source {
         let t = view.top.max(0.0);
         let r = (view.left + view.span_width).min(sw);
         let b = (view.top + view.span_height).min(sh);
-        let mut out = Pixels::new(view.width.try_into()?, view.height.try_into()?)?;
         if r <= l || b <= t {
-            return out.freeze(false);
+            return Pixels::new(view.width.try_into()?, view.height.try_into()?)?.freeze(false);
         }
         let x = ((l - view.left) / view.span_width * f64::from(view.width))
             .round()
@@ -222,19 +280,46 @@ impl Source {
             .clamp(f64::from(y), f64::from(view.height)) as u32;
         let (w, h) = (right - x, bottom - y);
         if w == 0 || h == 0 {
-            return out.freeze(false);
+            return Pixels::new(view.width.try_into()?, view.height.try_into()?)?.freeze(false);
         }
-        let (frame, crop) = if let Some(levels) = &self.tiles {
+        let (frame, mut crop) = if let Some(levels) = &self.tiles {
             self.region(levels, (l, t, r, b), (w, h), swap)?
         } else {
-            (
-                animation
-                    .or(self.frame.as_ref())
+            let frame = if let Some(frame) = animation {
+                frame.clone()
+            } else {
+                let mut frame = self
+                    .frame
+                    .as_ref()
                     .ok_or("missing image pixels")?
-                    .clone(),
-                [l, t, r - l, b - t],
-            )
+                    .lock()
+                    .unwrap();
+                let required = (f64::from(view.width) / view.span_width)
+                    .max(f64::from(view.height) / view.span_height)
+                    .min(1.0);
+                let scale = (f64::from(frame.width) / sw).min(f64::from(frame.height) / sh);
+                if scale + 1e-8 < required {
+                    let pixels = Pixels::native(
+                        self.input.reader()?,
+                        ImageFormat::Jpeg,
+                        256 * 1024 * 1024,
+                        (sw.max(sh) * required).ceil() as u32,
+                    )?;
+                    if pixels.original_size != self.size {
+                        return Err("image changed while open".into());
+                    }
+                    *frame = pixels.freeze(swap)?;
+                }
+                frame.clone()
+            };
+            let sx = f64::from(frame.width) / sw;
+            let sy = f64::from(frame.height) / sh;
+            (frame, [l * sx, t * sy, (r - l) * sx, (b - t) * sy])
         };
+        crop[0] = crop[0].clamp(0.0, f64::from(frame.width));
+        crop[1] = crop[1].clamp(0.0, f64::from(frame.height));
+        crop[2] = crop[2].min(f64::from(frame.width) - crop[0]);
+        crop[3] = crop[3].min(f64::from(frame.height) - crop[1]);
         if x == 0
             && y == 0
             && w == view.width
@@ -245,6 +330,7 @@ impl Source {
         {
             return Ok(frame);
         }
+        let mut out = Pixels::new(view.width.try_into()?, view.height.try_into()?)?;
         let data = frame.map()?;
         let source = ImageRef::new(frame.width as u32, frame.height as u32, &data, U8x4)?;
         let options = ResizeOptions::new()
@@ -370,6 +456,32 @@ impl Source {
         ))
     }
 }
+fn strips(input: &Input, size: (u32, u32), rows: u32) -> Result<Pixels> {
+    let mut pixels = Pixels::new(size.0.try_into()?, size.1.try_into()?)?;
+    if rows == 0 {
+        return Err("invalid TIFF strip height".into());
+    }
+    let stride = size.0 as usize * rows as usize * 4;
+    let mut decoder = Decoder::new(input.reader()?)?;
+    if decoder.dimensions()? != size
+        || decoder.colortype()? != ColorType::RGB(8)
+        || decoder.get_chunk_type() != ChunkType::Strip
+        || decoder.chunk_dimensions().1.min(size.1) != rows
+    {
+        return Err("TIFF changed while open".into());
+    }
+    for (index, target) in pixels.mapping.chunks_mut(stride).enumerate() {
+        let DecodingResult::U8(bytes) = decoder.read_chunk(index as u32)? else {
+            return Err("invalid TIFF samples".into());
+        };
+        if bytes.len() != target.len() / 4 * 3 {
+            return Err("invalid TIFF strip size".into());
+        }
+        crate::image::expand_rgb(&bytes, target);
+    }
+    Ok(pixels)
+}
+
 fn tile_supported<R: BufRead + Seek>(d: &mut Decoder<R>) -> Result<bool> {
     Ok(d.get_chunk_type() == ChunkType::Tile
         && matches!(

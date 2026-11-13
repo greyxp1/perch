@@ -41,7 +41,8 @@ opt-in, with a 16 MiB frame limit.
 
 Supported tiled TIFFs read only the visible region and can use reduced-resolution
 images in the main TIFF directory chain. Large tiled images without an overview
-open in inspection mode. Other formats decode the whole image.
+open in inspection mode. Large JPEGs start with a reduced decode and load more
+detail when zoomed. Other formats decode the whole image.
 
 ## Nix
 

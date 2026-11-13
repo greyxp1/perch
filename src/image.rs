@@ -15,7 +15,8 @@ use nix::{
 use spng::raw::ChunkAvail;
 use std::{
     fs::File,
-    io::{BufRead, Read, Seek},
+    io::{BufRead, Cursor, Read, Seek},
+    os::fd::{AsRawFd, IntoRawFd},
     path::PathBuf,
     sync::{Arc, OnceLock},
 };
@@ -26,6 +27,7 @@ pub struct Pixels {
     pub width: i32,
     pub height: i32,
     pub orientation: Orientation,
+    pub original_size: (u32, u32),
 }
 impl Pixels {
     pub fn new(width: i32, height: i32) -> Result<Self> {
@@ -44,13 +46,19 @@ impl Pixels {
             FcntlArg::F_ADD_SEALS(SealFlag::F_SEAL_GROW | SealFlag::F_SEAL_SHRINK),
         )?;
         // This private sealed file cannot shrink while mapped.
-        let mapping = unsafe { MmapOptions::new().len(size as usize).map_mut(&file)? };
+        let mapping = unsafe {
+            MmapOptions::new()
+                .len(size as usize)
+                .populate()
+                .map_mut(&file)?
+        };
         Ok(Self {
             file,
             mapping,
             width,
             height,
             orientation: Orientation::NoTransforms,
+            original_size: (width as u32, height as u32),
         })
     }
     pub fn load(
@@ -67,6 +75,9 @@ impl Pixels {
             });
         match format {
             Some(ImageFormat::Png) => Self::png(reader),
+            Some(format @ (ImageFormat::Jpeg | ImageFormat::WebP)) => {
+                Self::native(reader, format, limit, 1920)
+            }
             Some(format) => {
                 let (image, orientation) = decode(reader, format)?;
                 let mut pixels = Self::raster(image)?;
@@ -136,22 +147,174 @@ impl Pixels {
             .chunk_avail()?
             .and_then(|exif| Orientation::from_exif_chunk(exif.data()))
             .unwrap_or(Orientation::NoTransforms);
-        if orientation != Orientation::NoTransforms {
-            let mut image = DynamicImage::ImageRgba8(
-                image::RgbaImage::from_raw(info.width, info.height, pixels.mapping.to_vec())
-                    .ok_or("invalid PNG size")?,
-            );
-            image.apply_orientation(orientation);
+        pixels.premultiply()?;
+        pixels.orient(orientation)
+    }
+    fn premultiply(&mut self) -> Result<()> {
+        MulDiv::default().multiply_alpha_inplace(&mut Image::from_slice_u8(
+            self.width as u32,
+            self.height as u32,
+            &mut self.mapping,
+            U8x4,
+        )?)?;
+        Ok(())
+    }
+    pub fn orient(self, orientation: Orientation) -> Result<Self> {
+        if orientation == Orientation::NoTransforms {
+            return Ok(self);
+        }
+        let mut image = DynamicImage::ImageRgba8(
+            image::RgbaImage::from_raw(
+                self.width as u32,
+                self.height as u32,
+                self.mapping.to_vec(),
+            )
+            .ok_or("invalid image size")?,
+        );
+        image.apply_orientation(orientation);
+        let (w, h) = image.dimensions();
+        let mut pixels = Self::new(w.try_into()?, h.try_into()?)?;
+        pixels.mapping.copy_from_slice(image.as_bytes());
+        pixels.orientation = orientation;
+        pixels.original_size = if orientation.to_exif() >= 5 {
+            (self.original_size.1, self.original_size.0)
+        } else {
+            self.original_size
+        };
+        Ok(pixels)
+    }
+    pub fn native(
+        mut reader: impl BufRead + Seek,
+        format: ImageFormat,
+        limit: usize,
+        max_side: u32,
+    ) -> Result<Self> {
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes)?;
+        let mut decoder = ImageReader::with_format(Cursor::new(&bytes), format).into_decoder()?;
+        let (w, h) = decoder.dimensions();
+        let orientation = decoder.orientation()?;
+        drop(decoder);
+        if u64::from(w) * u64::from(h) * 4 > limit as u64 {
+            return Err("image exceeds the decoded memory budget".into());
+        }
+        let (width, height) = if format == ImageFormat::Jpeg {
+            // Decode enough DCT samples for the view and retain full-resolution coordinates.
+            unsafe {
+                let mut count = 0;
+                let scales = tjGetScalingFactors(&mut count);
+                if scales.is_null() || !(1..=64).contains(&count) {
+                    return Err("cannot query JPEG scaling factors".into());
+                }
+                std::slice::from_raw_parts(scales, count as usize)
+                    .iter()
+                    .filter(|s| s.num > 0 && s.denom > 0 && s.num <= s.denom)
+                    .map(|s| {
+                        (
+                            (u64::from(w) * s.num as u64).div_ceil(s.denom as u64) as u32,
+                            (u64::from(h) * s.num as u64).div_ceil(s.denom as u64) as u32,
+                        )
+                    })
+                    .filter(|(x, y)| (*x).max(*y) >= max_side.min(w.max(h)))
+                    .min_by_key(|(x, y)| u64::from(*x) * u64::from(*y))
+                    .unwrap_or((w, h))
+            }
+        } else {
+            (w, h)
+        };
+        let mut pixels = Self::new(width.try_into()?, height.try_into()?)?;
+        pixels.original_size = (w, h);
+        // Both codecs receive immutable input and a checked, full-size writable RGBA buffer.
+        let decoded = unsafe {
+            if format == ImageFormat::WebP {
+                !WebPDecodeRGBAInto(
+                    bytes.as_ptr(),
+                    bytes.len(),
+                    pixels.mapping.as_mut_ptr(),
+                    pixels.mapping.len(),
+                    pixels.width * 4,
+                )
+                .is_null()
+            } else {
+                let handle = tjInitDecompress();
+                if handle.is_null() {
+                    return Err("cannot initialize JPEG decoder".into());
+                }
+                let (mut width, mut height, mut sampling, mut colorspace) = (0, 0, 0, 0);
+                let header = tjDecompressHeader3(
+                    handle,
+                    bytes.as_ptr(),
+                    bytes.len() as _,
+                    &mut width,
+                    &mut height,
+                    &mut sampling,
+                    &mut colorspace,
+                );
+                let decoded = header == 0
+                    && (width, height) == (w as i32, h as i32)
+                    && tjDecompress2(
+                        handle,
+                        bytes.as_ptr(),
+                        bytes.len() as _,
+                        pixels.mapping.as_mut_ptr(),
+                        pixels.width,
+                        pixels.width * 4,
+                        pixels.height,
+                        7,
+                        0,
+                    ) == 0;
+                tjDestroy(handle);
+                decoded
+            }
+        };
+        if !decoded {
+            // Preserve animated WebP and JPEG color spaces unsupported by the native codec.
+            drop(pixels);
+            let (image, orientation) = decode(Cursor::new(bytes), format)?;
             let mut pixels = Self::raster(image)?;
             pixels.orientation = orientation;
             return Ok(pixels);
         }
-        MulDiv::default().multiply_alpha_inplace(&mut Image::from_slice_u8(
-            info.width,
-            info.height,
-            &mut pixels.mapping,
-            U8x4,
-        )?)?;
+        if format == ImageFormat::WebP {
+            pixels.premultiply()?;
+        }
+        pixels.orient(orientation)
+    }
+    pub fn tiff(file: File, size: (u32, u32)) -> Result<Self> {
+        let mut pixels = Self::new(size.0.try_into()?, size.1.try_into()?)?;
+        // Failed TIFF opens retain the fd, successful opens transfer it to TIFFClose.
+        let decoded = unsafe {
+            let options = TIFFOpenOptionsAlloc();
+            if options.is_null() {
+                return Err("cannot initialize TIFF decoder".into());
+            }
+            TIFFOpenOptionsSetMaxSingleMemAlloc(options, 128 * 1024 * 1024);
+            TIFFOpenOptionsSetMaxCumulatedMemAlloc(options, 256 * 1024 * 1024);
+            let handle = TIFFFdOpenExt(file.as_raw_fd(), c"perch".as_ptr(), c"r".as_ptr(), options);
+            TIFFOpenOptionsFree(options);
+            if handle.is_null() {
+                return Err("cannot open TIFF decoder".into());
+            }
+            let _ = file.into_raw_fd();
+            let (mut w, mut h) = (0_u32, 0_u32);
+            let decoded = TIFFGetField(handle, 256, &mut w) == 1
+                && TIFFGetField(handle, 257, &mut h) == 1
+                && (w, h) == size
+                && TIFFSetField(handle, 274, 1_i32) == 1
+                && TIFFReadRGBAImageOriented(
+                    handle,
+                    w,
+                    h,
+                    pixels.mapping.as_mut_ptr().cast(),
+                    1,
+                    1,
+                ) == 1;
+            TIFFClose(handle);
+            decoded
+        };
+        if !decoded {
+            return Err("cannot decode TIFF pixels".into());
+        }
         Ok(pixels)
     }
     pub fn raster(image: DynamicImage) -> Result<Self> {
@@ -205,7 +368,7 @@ fn decode(
     image.apply_orientation(orientation);
     Ok((image, orientation))
 }
-fn expand_rgb(source: &[u8], target: &mut [u8]) {
+pub fn expand_rgb(source: &[u8], target: &mut [u8]) {
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("ssse3") {
         // Detection gates the only instruction set extension used by this implementation.
@@ -267,7 +430,7 @@ impl Frame {
     }
     pub fn map(&self) -> Result<Mmap> {
         // Frame lengths are sealed and Perch drops writable mappings before sharing.
-        Ok(unsafe { MmapOptions::new().map(&self.file)? })
+        Ok(unsafe { MmapOptions::new().populate().map(&self.file)? })
     }
 }
 impl Pixels {
@@ -285,4 +448,79 @@ impl Pixels {
             height: self.height,
         }))
     }
+}
+
+#[link(name = "webpdecoder", kind = "static")]
+unsafe extern "C" {
+    fn WebPDecodeRGBAInto(
+        input: *const u8,
+        length: usize,
+        output: *mut u8,
+        size: usize,
+        stride: i32,
+    ) -> *mut u8;
+}
+#[link(name = "turbojpeg", kind = "static")]
+unsafe extern "C" {
+    fn tjInitDecompress() -> *mut nix::libc::c_void;
+    fn tjDecompressHeader3(
+        handle: *mut nix::libc::c_void,
+        input: *const u8,
+        length: nix::libc::c_ulong,
+        width: *mut i32,
+        height: *mut i32,
+        sampling: *mut i32,
+        colorspace: *mut i32,
+    ) -> i32;
+    fn tjDecompress2(
+        handle: *mut nix::libc::c_void,
+        input: *const u8,
+        length: nix::libc::c_ulong,
+        output: *mut u8,
+        width: i32,
+        stride: i32,
+        height: i32,
+        format: i32,
+        flags: i32,
+    ) -> i32;
+    fn tjDestroy(handle: *mut nix::libc::c_void) -> i32;
+}
+
+#[repr(C)]
+struct JpegScale {
+    num: i32,
+    denom: i32,
+}
+#[link(name = "turbojpeg", kind = "static")]
+unsafe extern "C" {
+    fn tjGetScalingFactors(count: *mut i32) -> *const JpegScale;
+}
+
+pub fn native_tiff(compression: u16) -> bool {
+    unsafe { TIFFIsCODECConfigured(compression) != 0 }
+}
+#[link(name = "tiff", kind = "static")]
+unsafe extern "C" {
+    fn TIFFIsCODECConfigured(compression: u16) -> i32;
+    fn TIFFOpenOptionsAlloc() -> *mut nix::libc::c_void;
+    fn TIFFOpenOptionsFree(options: *mut nix::libc::c_void);
+    fn TIFFOpenOptionsSetMaxSingleMemAlloc(options: *mut nix::libc::c_void, limit: isize);
+    fn TIFFOpenOptionsSetMaxCumulatedMemAlloc(options: *mut nix::libc::c_void, limit: isize);
+    fn TIFFFdOpenExt(
+        fd: i32,
+        name: *const nix::libc::c_char,
+        mode: *const nix::libc::c_char,
+        options: *mut nix::libc::c_void,
+    ) -> *mut nix::libc::c_void;
+    fn TIFFGetField(handle: *mut nix::libc::c_void, tag: u32, ...) -> i32;
+    fn TIFFSetField(handle: *mut nix::libc::c_void, tag: u32, ...) -> i32;
+    fn TIFFReadRGBAImageOriented(
+        handle: *mut nix::libc::c_void,
+        width: u32,
+        height: u32,
+        data: *mut u32,
+        orientation: i32,
+        stop: i32,
+    ) -> i32;
+    fn TIFFClose(handle: *mut nix::libc::c_void);
 }
