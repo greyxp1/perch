@@ -11,7 +11,9 @@ use nix::{
 };
 use std::{
     collections::BTreeMap,
+    fs::File,
     os::fd::{AsFd, OwnedFd},
+    os::unix::fs::FileExt,
     path::PathBuf,
     sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
@@ -27,6 +29,9 @@ use wayland_protocols::{
     wp::viewporter::client::{wp_viewport, wp_viewporter},
     xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base},
 };
+use xkb::keysyms;
+use xkbcommon::xkb;
+
 impl Frame {
     fn buffer(
         &self,
@@ -53,6 +58,10 @@ struct Seat {
     key_pin: Option<u64>,
     position: (f64, f64),
     dragging: bool,
+    keys: Option<xkb::State>,
+    repeat_rate: i32,
+    repeat_delay: i32,
+    repeating: Option<(u32, u32, Instant)>,
 }
 struct Pin {
     surface: wl_surface::WlSurface,
@@ -162,9 +171,12 @@ impl Pin {
             width *= ratio;
             height *= ratio;
         }
-        let ratio = (4096.0 / width).min(4096.0 / height).min(1.0);
-        width *= ratio;
-        height *= ratio;
+        let pixels = crate::RENDER_BYTES / 4;
+        let ratio = (pixels as f64 / (width * height)).sqrt().min(1.0);
+        width = (width * ratio).round().clamp(1.0, pixels as f64);
+        height = (height * ratio)
+            .round()
+            .clamp(1.0, (pixels / width as usize) as f64);
         let (left, top, span_width, span_height) = if self.inspect {
             (
                 self.center.0 - f64::from(self.size.0) / self.zoom / 2.0,
@@ -181,15 +193,15 @@ impl Pin {
             )
         };
         View {
-            width: width.round().max(1.0) as u32,
-            height: height.round().max(1.0) as u32,
+            width: width as u32,
+            height: height as u32,
             left,
             top,
             span_width,
             span_height,
         }
     }
-    fn zoom(&mut self, value: f64, position: (f64, f64)) {
+    fn zoom(&mut self, value: f64) {
         let minimum = if self.inspect {
             (f64::from(self.size.0) / f64::from(self.source.size.0))
                 .min(f64::from(self.size.1) / f64::from(self.source.size.1))
@@ -200,10 +212,6 @@ impl Pin {
         let old = self.zoom;
         self.zoom = (old * 1.1_f64.powf(-value / 15.0)).clamp(minimum, 8.0_f64.max(minimum));
         if self.inspect {
-            self.center.0 +=
-                (position.0 - f64::from(self.size.0) / 2.0) * (1.0 / old - 1.0 / self.zoom);
-            self.center.1 +=
-                (position.1 - f64::from(self.size.1) / 2.0) * (1.0 / old - 1.0 / self.zoom);
             self.clamp_center();
         } else {
             self.size = (
@@ -361,6 +369,7 @@ impl App {
             }
             if seat.key_pin == Some(id) {
                 seat.key_pin = None;
+                seat.repeating = None;
             }
         }
     }
@@ -427,8 +436,12 @@ impl App {
         }
     }
     fn key(&mut self, id: u64, key: u32) {
-        if key == 105 || key == 106 {
-            self.navigate(id, if key == 105 { -1 } else { 1 });
+        if key == keysyms::KEY_q || key == keysyms::KEY_Q {
+            self.close_pin(id);
+            return;
+        }
+        if key == keysyms::KEY_Left || key == keysyms::KEY_Right {
+            self.navigate(id, if key == keysyms::KEY_Left { -1 } else { 1 });
             return;
         }
         let Some(pin) = self.pins.get_mut(&id) else {
@@ -438,13 +451,13 @@ impl App {
             return;
         }
         match key {
-            57 if pin.source.animated => {
+            keysyms::KEY_space if pin.source.animated => {
                 pin.playing = !pin.playing;
                 pin.next_frame = Instant::now();
                 pin.invalidate();
                 pin.title();
             }
-            15 => {
+            keysyms::KEY_Tab => {
                 if !pin.source.region_only() {
                     pin.inspect = !pin.inspect;
                     if !pin.inspect {
@@ -458,9 +471,9 @@ impl App {
                 pin.invalidate();
                 pin.title();
             }
-            102 | 107 => {
+            keysyms::KEY_Home | keysyms::KEY_End => {
                 if pin.inspect {
-                    pin.zoom = if key == 107 {
+                    pin.zoom = if key == keysyms::KEY_End {
                         1.0
                     } else {
                         (f64::from(pin.size.0) / f64::from(pin.source.size.0))
@@ -473,7 +486,11 @@ impl App {
                     );
                     pin.clamp_center();
                 } else {
-                    pin.zoom = if key == 107 { 1.0 } else { pin.fit() };
+                    pin.zoom = if key == keysyms::KEY_End {
+                        1.0
+                    } else {
+                        pin.fit()
+                    };
                     pin.size = (
                         (f64::from(pin.source.size.0) * pin.zoom).round().max(1.0) as i32,
                         (f64::from(pin.source.size.1) * pin.zoom).round().max(1.0) as i32,
@@ -595,6 +612,30 @@ impl App {
         }
     }
     fn schedule(&mut self, qh: &QueueHandle<Self>) -> Option<Duration> {
+        let now = Instant::now();
+        let mut wait = None;
+        let mut repeats = Vec::new();
+        for seat in self.seats.values_mut() {
+            if let Some((_, key, deadline)) = &mut seat.repeating {
+                if *deadline <= now {
+                    if let Some(id) = seat.key_pin {
+                        repeats.push((id, *key));
+                    }
+                    *deadline = now + Duration::from_secs_f64(1.0 / f64::from(seat.repeat_rate));
+                }
+                let delay = deadline.saturating_duration_since(now);
+                wait = Some(wait.map_or(delay, |old: Duration| old.min(delay)));
+            }
+        }
+        for (id, key) in repeats {
+            if self
+                .pins
+                .get(&id)
+                .is_some_and(|pin| !pin.loading && !pin.busy)
+            {
+                self.key(id, key);
+            }
+        }
         let worker = self.worker.as_ref().unwrap();
         for (&id, pending) in &mut self.pending {
             if let PendingState::Queued(inputs) = &pending.state
@@ -608,8 +649,6 @@ impl App {
                 pending.state = PendingState::Decoding;
             }
         }
-        let now = Instant::now();
-        let mut wait = None;
         for (&id, pin) in &mut self.pins {
             if !pin.configured || pin.loading {
                 continue;
@@ -687,6 +726,10 @@ impl Dispatch<wl_registry::WlRegistry, ()> for App {
                             key_pin: None,
                             position: (0.0, 0.0),
                             dragging: false,
+                            keys: None,
+                            repeat_rate: 0,
+                            repeat_delay: 0,
+                            repeating: None,
                         },
                     );
                 }
@@ -819,6 +862,8 @@ impl Dispatch<wl_seat::WlSeat, u32> for App {
                     keyboard.release();
                 }
                 seat.key_pin = None;
+                seat.keys = None;
+                seat.repeating = None;
             }
         }
     }
@@ -896,7 +941,7 @@ impl Dispatch<wl_pointer::WlPointer, u32> for App {
                 ..
             } => {
                 if let Some(pin) = seat.pin.and_then(|id| state.pins.get_mut(&id)) {
-                    pin.zoom(value, seat.position);
+                    pin.zoom(value);
                 }
             }
             _ => {}
@@ -916,17 +961,89 @@ impl Dispatch<wl_keyboard::WlKeyboard, u32> for App {
             return;
         };
         match event {
-            wl_keyboard::Event::Enter { surface, .. } => {
-                seat.key_pin = surface.data::<u64>().copied()
+            wl_keyboard::Event::Keymap {
+                format: WEnum::Value(wl_keyboard::KeymapFormat::XkbV1),
+                fd,
+                size,
+            } => {
+                seat.keys = None;
+                seat.repeating = None;
+                let mut bytes = vec![0; (size as usize).min(16 * 1024 * 1024)];
+                if size <= 16 * 1024 * 1024
+                    && File::from(fd).read_exact_at(&mut bytes, 0).is_ok()
+                    && let Ok(text) = String::from_utf8(bytes)
+                {
+                    let context = xkb::Context::new(xkb::CONTEXT_NO_DEFAULT_INCLUDES);
+                    if let Some(keymap) = xkb::Keymap::new_from_string(
+                        &context,
+                        text.trim_end_matches('\0').to_owned(),
+                        xkb::KEYMAP_FORMAT_TEXT_V1,
+                        xkb::KEYMAP_COMPILE_NO_FLAGS,
+                    ) {
+                        seat.keys = Some(xkb::State::new(&keymap));
+                    }
+                }
             }
-            wl_keyboard::Event::Leave { .. } => seat.key_pin = None,
-            wl_keyboard::Event::Key {
-                key,
-                state: WEnum::Value(wl_keyboard::KeyState::Pressed),
+            wl_keyboard::Event::RepeatInfo { rate, delay } => {
+                seat.repeat_rate = rate.max(0);
+                seat.repeat_delay = delay.max(0);
+                if rate <= 0 {
+                    seat.repeating = None;
+                }
+            }
+            wl_keyboard::Event::Modifiers {
+                mods_depressed,
+                mods_latched,
+                mods_locked,
+                group,
                 ..
             } => {
-                if let Some(id) = seat.key_pin {
-                    state.key(id, key);
+                if let Some(keys) = &mut seat.keys {
+                    keys.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
+                }
+            }
+            wl_keyboard::Event::Enter { surface, .. } => {
+                seat.repeating = None;
+                seat.key_pin = surface.data::<u64>().copied();
+            }
+            wl_keyboard::Event::Leave { .. } => {
+                seat.key_pin = None;
+                seat.repeating = None;
+            }
+            wl_keyboard::Event::Key {
+                key,
+                state: WEnum::Value(pressed),
+                ..
+            } => {
+                if pressed == wl_keyboard::KeyState::Released {
+                    if seat.repeating.is_some_and(|(held, _, _)| held == key) {
+                        seat.repeating = None;
+                    }
+                } else if let Some(id) = seat.key_pin {
+                    let symbol = seat.keys.as_ref().and_then(|keys| {
+                        key.checked_add(8).map(|code| {
+                            (
+                                keys.key_get_one_sym(code.into()).raw(),
+                                keys.get_keymap().key_repeats(code.into()),
+                            )
+                        })
+                    });
+                    if let Some((symbol, repeats)) = symbol {
+                        if repeats {
+                            seat.repeating = None;
+                        }
+                        if matches!(symbol, keysyms::KEY_Left | keysyms::KEY_Right)
+                            && repeats
+                            && seat.repeat_rate > 0
+                        {
+                            seat.repeating = Some((
+                                key,
+                                symbol,
+                                Instant::now() + Duration::from_millis(seat.repeat_delay as u64),
+                            ));
+                        }
+                        state.key(id, symbol);
+                    }
                 }
             }
             _ => {}

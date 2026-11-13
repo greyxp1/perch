@@ -34,7 +34,7 @@ impl Pixels {
         let size = width
             .checked_mul(height)
             .and_then(|n| n.checked_mul(4))
-            .filter(|n| width > 0 && height > 0 && *n <= 256 * 1024 * 1024)
+            .filter(|_| width > 0 && height > 0)
             .ok_or("image is too large")?;
         let file = File::from(memfd_create(
             c"perch",
@@ -79,7 +79,7 @@ impl Pixels {
                 Self::native(reader, format, limit, 1920)
             }
             Some(format) => {
-                let (image, orientation) = decode(reader, format)?;
+                let (image, orientation) = decode(reader, format, limit)?;
                 let mut pixels = Self::raster(image)?;
                 pixels.orientation = orientation;
                 Ok(pixels)
@@ -270,7 +270,7 @@ impl Pixels {
         if !decoded {
             // Preserve animated WebP and JPEG color spaces unsupported by the native codec.
             drop(pixels);
-            let (image, orientation) = decode(Cursor::new(bytes), format)?;
+            let (image, orientation) = decode(Cursor::new(bytes), format, limit)?;
             let mut pixels = Self::raster(image)?;
             pixels.orientation = orientation;
             return Ok(pixels);
@@ -282,35 +282,19 @@ impl Pixels {
     }
     pub fn tiff(file: File, size: (u32, u32)) -> Result<Self> {
         let mut pixels = Self::new(size.0.try_into()?, size.1.try_into()?)?;
-        // Failed TIFF opens retain the fd, successful opens transfer it to TIFFClose.
+        let tiff = Tiff::open(file)?;
         let decoded = unsafe {
-            let options = TIFFOpenOptionsAlloc();
-            if options.is_null() {
-                return Err("cannot initialize TIFF decoder".into());
-            }
-            TIFFOpenOptionsSetMaxSingleMemAlloc(options, 128 * 1024 * 1024);
-            TIFFOpenOptionsSetMaxCumulatedMemAlloc(options, 256 * 1024 * 1024);
-            let handle = TIFFFdOpenExt(file.as_raw_fd(), c"perch".as_ptr(), c"r".as_ptr(), options);
-            TIFFOpenOptionsFree(options);
-            if handle.is_null() {
-                return Err("cannot open TIFF decoder".into());
-            }
-            let _ = file.into_raw_fd();
-            let (mut w, mut h) = (0_u32, 0_u32);
-            let decoded = TIFFGetField(handle, 256, &mut w) == 1
-                && TIFFGetField(handle, 257, &mut h) == 1
-                && (w, h) == size
+            let handle = tiff.0;
+            tiff.dimensions()? == size
                 && TIFFSetField(handle, 274, 1_i32) == 1
                 && TIFFReadRGBAImageOriented(
                     handle,
-                    w,
-                    h,
+                    size.0,
+                    size.1,
                     pixels.mapping.as_mut_ptr().cast(),
                     1,
                     1,
-                ) == 1;
-            TIFFClose(handle);
-            decoded
+                ) == 1
         };
         if !decoded {
             return Err("cannot decode TIFF pixels".into());
@@ -333,12 +317,27 @@ impl Pixels {
     }
 }
 
+pub fn limits(bytes: usize) -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_alloc = (bytes != usize::MAX).then_some(bytes as u64);
+    limits
+}
+
+pub fn tiff_limits(bytes: usize) -> tiff::decoder::Limits {
+    let mut limits = tiff::decoder::Limits::default();
+    limits.decoding_buffer_size = bytes;
+    limits.intermediate_buffer_size = bytes;
+    limits.ifd_value_size = bytes;
+    limits
+}
+
 fn decode(
     mut reader: impl BufRead + Seek,
     format: ImageFormat,
+    limit: usize,
 ) -> Result<(DynamicImage, Orientation)> {
     if format == ImageFormat::Tiff {
-        let mut decoder = tiff::decoder::Decoder::new(&mut reader)?;
+        let mut decoder = tiff::decoder::Decoder::new(&mut reader)?.with_limits(tiff_limits(limit));
         if decoder.colortype()? == tiff::ColorType::RGB(8)
             && decoder
                 .find_tag_unsigned::<u16>(tiff::tags::Tag::PlanarConfiguration)?
@@ -362,7 +361,9 @@ fn decode(
         drop(decoder);
         reader.rewind()?;
     }
-    let mut decoder = ImageReader::with_format(reader, format).into_decoder()?;
+    let mut reader = ImageReader::with_format(reader, format);
+    reader.limits(limits(limit));
+    let mut decoder = reader.into_decoder()?;
     let orientation = decoder.orientation()?;
     let mut image = DynamicImage::from_decoder(decoder)?;
     image.apply_orientation(orientation);
@@ -499,18 +500,139 @@ unsafe extern "C" {
 pub fn native_tiff(compression: u16) -> bool {
     unsafe { TIFFIsCODECConfigured(compression) != 0 }
 }
+
+pub struct Tiff(*mut nix::libc::c_void);
+impl Drop for Tiff {
+    fn drop(&mut self) {
+        unsafe { TIFFClose(self.0) }
+    }
+}
+impl Tiff {
+    pub fn open(file: File) -> Result<Self> {
+        // Failed opens retain the fd, successful opens transfer it to TIFFClose.
+        unsafe {
+            let handle = TIFFFdOpen(file.as_raw_fd(), c"perch".as_ptr(), c"r".as_ptr());
+            if handle.is_null() {
+                return Err("cannot open TIFF decoder".into());
+            }
+            let _ = file.into_raw_fd();
+            Ok(Self(handle))
+        }
+    }
+    pub fn dimensions(&self) -> Result<(u32, u32)> {
+        let (mut w, mut h) = (0_u32, 0_u32);
+        if unsafe {
+            TIFFGetField(self.0, 256, &mut w) == 1 && TIFFGetField(self.0, 257, &mut h) == 1
+        } && w > 0
+            && h > 0
+        {
+            Ok((w, h))
+        } else {
+            Err("invalid TIFF dimensions".into())
+        }
+    }
+    pub fn orientation(&self) -> u16 {
+        let mut value = 1_u16;
+        unsafe {
+            TIFFGetField(self.0, 274, &mut value);
+        }
+        value
+    }
+    pub fn offset(&self) -> u64 {
+        unsafe { TIFFCurrentDirOffset(self.0) }
+    }
+    pub fn seek(&mut self, offset: u64) -> Result<()> {
+        if unsafe { TIFFSetSubDirectory(self.0, offset) } == 1 {
+            Ok(())
+        } else {
+            Err("cannot read TIFF directory".into())
+        }
+    }
+    pub fn next(&mut self) -> bool {
+        unsafe { TIFFReadDirectory(self.0) == 1 }
+    }
+    pub fn children(&self) -> Vec<u64> {
+        let mut count = 0_u16;
+        let mut offsets: *const u64 = std::ptr::null();
+        if unsafe { TIFFGetField(self.0, 330, &mut count, &mut offsets) } == 1 && !offsets.is_null()
+        {
+            unsafe { std::slice::from_raw_parts(offsets, usize::from(count)).to_vec() }
+        } else {
+            Vec::new()
+        }
+    }
+    pub fn reduced(&self) -> bool {
+        let mut kind = 0_u32;
+        unsafe {
+            TIFFGetField(self.0, 254, &mut kind);
+        }
+        kind & 1 != 0
+    }
+    pub fn tiled(&self) -> bool {
+        let mut message = [0_i8; 1024];
+        unsafe { TIFFIsTiled(self.0) == 1 && TIFFRGBAImageOK(self.0, message.as_mut_ptr()) == 1 }
+    }
+    pub fn region(&mut self, rect: (u32, u32, u32, u32)) -> Result<Pixels> {
+        let (left, top, right, bottom) = rect;
+        let (mut tw, mut th) = (0_u32, 0_u32);
+        if unsafe {
+            TIFFGetField(self.0, 322, &mut tw) != 1 || TIFFGetField(self.0, 323, &mut th) != 1
+        } || tw == 0
+            || th == 0
+        {
+            return Err("invalid TIFF tile dimensions".into());
+        }
+        let bytes = u64::from(tw)
+            .saturating_mul(u64::from(th))
+            .saturating_mul(4);
+        if bytes > isize::MAX as u64 {
+            return Err("TIFF tile is too large".into());
+        }
+        let mut tile = vec![0_u32; (bytes / 4) as usize];
+        let mut out = Pixels::new((right - left).try_into()?, (bottom - top).try_into()?)?;
+        // libtiff returns associated RGBA in bottom-up tile rows. Orient the gathered region once.
+        if unsafe { TIFFSetField(self.0, 274, 1_i32) } != 1 {
+            return Err("invalid TIFF orientation".into());
+        }
+        for y in (top / th..=(bottom - 1) / th).map(|y| y * th) {
+            for x in (left / tw..=(right - 1) / tw).map(|x| x * tw) {
+                if unsafe { TIFFReadRGBATileExt(self.0, x, y, tile.as_mut_ptr(), 1) } != 1 {
+                    return Err("cannot decode TIFF tile".into());
+                }
+                for yy in y.max(top)..y.saturating_add(th).min(bottom) {
+                    for xx in x.max(left)..x.saturating_add(tw).min(right) {
+                        let pixel =
+                            tile[((th - 1 - (yy - y)) as usize * tw as usize) + (xx - x) as usize];
+                        let q = ((yy - top) as usize * (right - left) as usize
+                            + (xx - left) as usize)
+                            * 4;
+                        out.mapping[q..q + 4].copy_from_slice(&pixel.to_le_bytes());
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+}
 #[link(name = "tiff", kind = "static")]
 unsafe extern "C" {
+    fn TIFFCurrentDirOffset(handle: *mut nix::libc::c_void) -> u64;
+    fn TIFFSetSubDirectory(handle: *mut nix::libc::c_void, offset: u64) -> i32;
+    fn TIFFReadDirectory(handle: *mut nix::libc::c_void) -> i32;
+    fn TIFFIsTiled(handle: *mut nix::libc::c_void) -> i32;
+    fn TIFFRGBAImageOK(handle: *mut nix::libc::c_void, message: *mut i8) -> i32;
+    fn TIFFReadRGBATileExt(
+        handle: *mut nix::libc::c_void,
+        x: u32,
+        y: u32,
+        data: *mut u32,
+        stop: i32,
+    ) -> i32;
     fn TIFFIsCODECConfigured(compression: u16) -> i32;
-    fn TIFFOpenOptionsAlloc() -> *mut nix::libc::c_void;
-    fn TIFFOpenOptionsFree(options: *mut nix::libc::c_void);
-    fn TIFFOpenOptionsSetMaxSingleMemAlloc(options: *mut nix::libc::c_void, limit: isize);
-    fn TIFFOpenOptionsSetMaxCumulatedMemAlloc(options: *mut nix::libc::c_void, limit: isize);
-    fn TIFFFdOpenExt(
+    fn TIFFFdOpen(
         fd: i32,
         name: *const nix::libc::c_char,
         mode: *const nix::libc::c_char,
-        options: *mut nix::libc::c_void,
     ) -> *mut nix::libc::c_void;
     fn TIFFGetField(handle: *mut nix::libc::c_void, tag: u32, ...) -> i32;
     fn TIFFSetField(handle: *mut nix::libc::c_void, tag: u32, ...) -> i32;

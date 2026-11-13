@@ -152,9 +152,7 @@ impl Client {
             }
             Request::Stdin(bytes) => match (packet[0], size) {
                 (1, 2..) => {
-                    if bytes.len() + size - 1 > 256 * 1024 * 1024 {
-                        return Err("image stream is too large".into());
-                    }
+                    bytes.try_reserve(size - 1)?;
                     bytes.extend_from_slice(&packet[1..size]);
                     Ok(None)
                 }

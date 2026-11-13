@@ -12,6 +12,7 @@ tiff = "0.11.3"
 fast_image_resize = { version = "6", features = ["only_u8x4"] }
 memmap2 = "0.9"
 nix = { version = "0.30", features = ["fs", "poll", "socket", "user"] }
+xkbcommon = "0.9"
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client"] }
 spng = { version = "0.2.0-alpha.3", features = ["zlib-ng"] }

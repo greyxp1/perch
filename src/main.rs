@@ -6,6 +6,7 @@ mod loader;
 
 use std::{ffi::OsString, process::ExitCode};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+const RENDER_BYTES: usize = 256 * 1024 * 1024;
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();

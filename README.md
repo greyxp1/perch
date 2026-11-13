@@ -8,8 +8,8 @@ Your compositor must support xdg-shell v4 and viewporter.
 
 - Left drag: move the window
 - Mouse wheel: resize the window
-- Right click: close the window
-- Left/right arrows: previous/next image
+- Right click or Q: close the window
+- Left/right arrows: previous/next image, hold to repeat
 - Space: play or pause animation
 - Tab: toggle inspection, where left drag pans and the wheel zooms
 - Home: fit the image
@@ -35,14 +35,15 @@ Or pipe an image through standard input:
 cat image.png | perch --stdin
 ```
 
-Standard input and each decoded image are limited to 256 MiB. Perch loads images
-in the background and keeps one next decoded image up to 64 MiB. Animation is
-opt-in, with a 16 MiB frame limit.
+Perch loads images in the background and keeps one next decoded image up to
+64 MiB. Animation is opt-in. Input, decoding and playback have no memory cap.
+Temporary render regions remain bounded, and each pixel buffer must fit
+Wayland's 2 GiB limit.
 
 Supported tiled TIFFs read only the visible region and can use reduced-resolution
-images in the main TIFF directory chain. Large tiled images without an overview
-open in inspection mode. Large JPEGs start with a reduced decode and load more
-detail when zoomed. Other formats decode the whole image.
+images in the main directory chain or SubIFDs. Large tiled images without an
+overview open in inspection mode. Large JPEGs start with a reduced decode and
+load more detail when zoomed. Other formats decode the whole image.
 
 ## Nix
 

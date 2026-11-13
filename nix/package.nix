@@ -3,6 +3,7 @@
   dejavu_fonts,
   lib,
   libjpeg,
+  libxkbcommon,
   libwebp,
   libtiff,
   rustPlatform,
@@ -13,7 +14,7 @@ let
     cmakeFlags = (old.cmakeFlags or []) ++ ["-DWITH_SYSTEM_ZLIB=ON"];
     buildInputs = (old.buildInputs or []) ++ [zlib];
   });
-in rustPlatform.buildRustPackage {
+in lib.overrideDerivation (rustPlatform.buildRustPackage {
   pname = "perch";
   version = "0.2.0";
   src = lib.fileset.toSource {
@@ -32,6 +33,13 @@ in rustPlatform.buildRustPackage {
   buildInputs = [
     # Bundled zlib would override Perch's zlib-ng symbols.
     jpeg
+    ((libxkbcommon.override {withWaylandTools = false;}).overrideAttrs (old: {
+      outputs = ["out" "dev"];
+      mesonFlags = (old.mesonFlags or []) ++ [
+        "-Denable-x11=false" "-Denable-xkbregistry=false"
+        "-Denable-tools=false" "-Denable-docs=false"
+      ];
+    }))
     (libtiff.overrideAttrs (old: {
       propagatedBuildInputs = [jpeg zlib];
       cmakeFlags = (old.cmakeFlags or []) ++ map (name: lib.cmakeBool name false) [
@@ -61,4 +69,4 @@ in rustPlatform.buildRustPackage {
     mainProgram = "perch";
     platforms = lib.platforms.linux;
   };
-}
+}) (old: {name = "${old.pname}-${old.version}";})

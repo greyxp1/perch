@@ -1,6 +1,6 @@
 use crate::{
     Result,
-    image::{Frame, Pixels},
+    image::{Frame, Pixels, Tiff, limits, tiff_limits},
 };
 use fast_image_resize::{
     PixelType::U8x4,
@@ -26,7 +26,6 @@ use tiff::{
 };
 
 pub const CACHE_BYTES: usize = 64 * 1024 * 1024;
-const REGION_BYTES: usize = 128 * 1024 * 1024;
 trait Reader: BufRead + Seek {}
 impl<T: BufRead + Seek> Reader for T {}
 struct SharedBytes(Arc<Vec<u8>>);
@@ -85,7 +84,7 @@ pub struct Source {
     tiles: Option<Vec<Level>>,
 }
 struct Level {
-    index: usize,
+    offset: u64,
     width: u32,
     height: u32,
 }
@@ -106,50 +105,65 @@ impl Source {
             .format()
             .or_else(|| input.path().and_then(|p| ImageFormat::from_path(p).ok()));
         if format == Some(ImageFormat::Tiff) {
-            let mut tiff = Decoder::new(&mut reader)?;
-            if tile_supported(&mut tiff)? {
-                let size = tiff.dimensions()?;
-                let mut levels = vec![Level {
-                    index: 0,
-                    width: size.0,
-                    height: size.1,
-                }];
-                for index in 1..32 {
-                    if !tiff.more_images() {
-                        break;
-                    }
-                    tiff.next_image()?;
-                    let reduced = tiff
-                        .find_tag_unsigned::<u32>(Tag::NewSubfileType)?
-                        .unwrap_or(0)
-                        & 1
-                        != 0;
-                    let (w, h) = tiff.dimensions()?;
-                    if reduced
-                        && tile_supported(&mut tiff)?
-                        && w <= size.0
-                        && h <= size.1
-                        && (f64::from(w) / f64::from(h) - f64::from(size.0) / f64::from(size.1))
-                            .abs()
+            if let Ok(mut native) = Tiff::open(input.file()?)
+                && native.tiled()
+            {
+                let raw_size = native.dimensions()?;
+                let orientation = Orientation::from_exif(native.orientation().try_into()?)
+                    .ok_or("invalid TIFF orientation")?;
+                let mut levels = Vec::new();
+                let mut pending = vec![(native.offset(), false)];
+                let mut visited = std::collections::HashSet::from([native.offset()]);
+                while let Some((offset, subifd)) = pending.pop() {
+                    native.seek(offset)?;
+                    let (w, h) = native.dimensions()?;
+                    if (levels.is_empty() || subifd || native.reduced())
+                        && native.tiled()
+                        && native.orientation() == u16::from(orientation.to_exif())
+                        && w <= raw_size.0
+                        && h <= raw_size.1
+                        && (f64::from(w) / f64::from(h)
+                            - f64::from(raw_size.0) / f64::from(raw_size.1))
+                        .abs()
                             < 0.01
                     {
                         levels.push(Level {
-                            index,
+                            offset,
                             width: w,
                             height: h,
                         });
                     }
+                    let children = native.children();
+                    let next = native.next().then(|| (native.offset(), false));
+                    for child in children
+                        .into_iter()
+                        .map(|offset| (offset, true))
+                        .chain(next)
+                    {
+                        if visited.insert(child.0) {
+                            if visited.len() > limit / 64 {
+                                return Err("TIFF directories exceed the memory budget".into());
+                            }
+                            pending.push(child);
+                        }
+                    }
                 }
                 levels.sort_by_key(|l| std::cmp::Reverse(u64::from(l.width) * u64::from(l.height)));
+                let size = if orientation.to_exif() >= 5 {
+                    (raw_size.1, raw_size.0)
+                } else {
+                    raw_size
+                };
                 return Ok(Arc::new(Self {
                     input,
                     size,
                     animated: false,
-                    orientation: Orientation::NoTransforms,
+                    orientation,
                     frame: None,
                     tiles: Some(levels),
                 }));
             }
+            let mut tiff = Decoder::new(&mut reader)?.with_limits(tiff_limits(limit));
             let size = tiff.dimensions()?;
             if u64::from(size.0) * u64::from(size.1) >= 1_000_000
                 && tiff.get_chunk_type() == ChunkType::Strip
@@ -191,10 +205,8 @@ impl Source {
         };
         let animated = match format {
             Some(ImageFormat::Png) => {
-                let decoder = image::codecs::png::PngDecoder::with_limits(
-                    &mut reader,
-                    image::Limits::default(),
-                )?;
+                let decoder =
+                    image::codecs::png::PngDecoder::with_limits(&mut reader, limits(limit))?;
                 dimensions(decoder.dimensions())?;
                 decoder.is_apng()?
             }
@@ -204,7 +216,9 @@ impl Source {
                 decoder.has_animation()
             }
             Some(format) => {
-                let decoder = ImageReader::with_format(&mut reader, format).into_decoder()?;
+                let mut reader = ImageReader::with_format(&mut reader, format);
+                reader.limits(limits(limit));
+                let decoder = reader.into_decoder()?;
                 dimensions(decoder.dimensions())?;
                 format == ImageFormat::Gif
             }
@@ -242,12 +256,13 @@ impl Source {
     pub fn region_only(&self) -> bool {
         self.tiles.as_ref().is_some_and(|levels| {
             let l = levels.last().unwrap();
-            u64::from(l.width) * u64::from(l.height) * 4 > REGION_BYTES as u64 / 2
+            (u64::from(l.width) * u64::from(l.height)).saturating_mul(4)
+                > crate::RENDER_BYTES as u64 / 2
         })
     }
     pub fn min_zoom(&self, size: (i32, i32)) -> f64 {
         if self.region_only() {
-            ((f64::from(size.0) * f64::from(size.1) * 8.0) / REGION_BYTES as f64).sqrt()
+            ((f64::from(size.0) * f64::from(size.1) * 8.0) / crate::RENDER_BYTES as f64).sqrt()
         } else {
             0.0
         }
@@ -302,7 +317,7 @@ impl Source {
                     let pixels = Pixels::native(
                         self.input.reader()?,
                         ImageFormat::Jpeg,
-                        256 * 1024 * 1024,
+                        usize::MAX,
                         (sw.max(sh) * required).ceil() as u32,
                     )?;
                     if pixels.original_size != self.size {
@@ -370,18 +385,26 @@ impl Source {
         output: (u32, u32),
         swap: bool,
     ) -> Result<(Arc<Frame>, [f64; 4])> {
+        let rotated = self.orientation.to_exif() >= 5;
+        let logical = |level: &Level| {
+            if rotated {
+                (level.height, level.width)
+            } else {
+                (level.width, level.height)
+            }
+        };
         let mut level = &levels[0];
         for candidate in levels {
-            if (rect.2 - rect.0) * f64::from(candidate.width) / f64::from(self.size.0)
-                >= f64::from(output.0)
-                && (rect.3 - rect.1) * f64::from(candidate.height) / f64::from(self.size.1)
-                    >= f64::from(output.1)
+            let (w, h) = logical(candidate);
+            if (rect.2 - rect.0) * f64::from(w) / f64::from(self.size.0) >= f64::from(output.0)
+                && (rect.3 - rect.1) * f64::from(h) / f64::from(self.size.1) >= f64::from(output.1)
             {
                 level = candidate;
             }
         }
-        let sx = f64::from(level.width) / f64::from(self.size.0);
-        let sy = f64::from(level.height) / f64::from(self.size.1);
+        let (lw, lh) = logical(level);
+        let sx = f64::from(lw) / f64::from(self.size.0);
+        let sy = f64::from(lh) / f64::from(self.size.1);
         let l = rect.0 * sx;
         let t = rect.1 * sy;
         let r = rect.2 * sx;
@@ -390,68 +413,34 @@ impl Source {
             (3.0 * ((r - l) / f64::from(output.0)).max((b - t) / f64::from(output.1))).ceil() + 1.0;
         let left = (l - halo).floor().max(0.0) as u32;
         let top = (t - halo).floor().max(0.0) as u32;
-        let right = (r + halo).ceil().min(f64::from(level.width)) as u32;
-        let bottom = (b + halo).ceil().min(f64::from(level.height)) as u32;
+        let right = (r + halo).ceil().min(f64::from(lw)) as u32;
+        let bottom = (b + halo).ceil().min(f64::from(lh)) as u32;
         let (width, height) = (right - left, bottom - top);
-        if u64::from(width) * u64::from(height) * 4 > REGION_BYTES as u64 {
+        if (u64::from(width) * u64::from(height)).saturating_mul(4) > crate::RENDER_BYTES as u64 {
             return Err("TIFF region is too large".into());
         }
-        let mut out = Pixels::new(width.try_into()?, height.try_into()?)?;
-        let mut decoder = Decoder::new(self.input.reader()?)?;
-        decoder.seek_to_image(level.index)?;
-        if decoder.dimensions()? != (level.width, level.height) || !tile_supported(&mut decoder)? {
+        let (w, h) = (level.width, level.height);
+        let raw = match self.orientation.to_exif() {
+            2 => (w - right, top, w - left, bottom),
+            3 => (w - right, h - bottom, w - left, h - top),
+            4 => (left, h - bottom, right, h - top),
+            5 => (top, left, bottom, right),
+            6 => (top, h - right, bottom, h - left),
+            7 => (w - bottom, h - right, w - top, h - left),
+            8 => (w - bottom, left, w - top, right),
+            _ => (left, top, right, bottom),
+        };
+        let mut decoder = Tiff::open(self.input.file()?)?;
+        decoder.seek(level.offset)?;
+        if decoder.dimensions()? != (w, h)
+            || !decoder.tiled()
+            || decoder.orientation() != u16::from(self.orientation.to_exif())
+        {
             return Err("TIFF changed while open".into());
         }
-        let (tw, th) = decoder.chunk_dimensions();
-        let across = level.width.div_ceil(tw);
-        let channels = match decoder.colortype()? {
-            ColorType::RGB(8) => 3,
-            ColorType::RGBA(8) => 4,
-            ColorType::Gray(8) => 1,
-            _ => return Err("unsupported TIFF tiles".into()),
-        };
-        let associated = decoder
-            .find_tag_unsigned_vec::<u16>(Tag::ExtraSamples)?
-            .is_some_and(|v| v.contains(&1));
-        for ty in top / th..=(bottom - 1) / th {
-            for tx in left / tw..=(right - 1) / tw {
-                let index = ty
-                    .checked_mul(across)
-                    .and_then(|i| i.checked_add(tx))
-                    .ok_or("too many TIFF tiles")?;
-                let (cw, ch) = decoder.chunk_data_dimensions(index);
-                let DecodingResult::U8(data) = decoder.read_chunk(index)? else {
-                    return Err("invalid TIFF tile samples".into());
-                };
-                if data.len() < cw as usize * ch as usize * channels {
-                    return Err("short TIFF tile".into());
-                }
-                for yy in (ty * th).max(top)..((ty * th + ch).min(bottom)) {
-                    for xx in (tx * tw).max(left)..((tx * tw + cw).min(right)) {
-                        let p = ((yy - ty * th) as usize * cw as usize + (xx - tx * tw) as usize)
-                            * channels;
-                        let mut pixel = match channels {
-                            1 => [data[p], data[p], data[p], 255],
-                            3 => [data[p], data[p + 1], data[p + 2], 255],
-                            _ => [data[p], data[p + 1], data[p + 2], data[p + 3]],
-                        };
-                        if !associated {
-                            for c in 0..3 {
-                                let n = u16::from(pixel[c]) * u16::from(pixel[3]) + 128;
-                                pixel[c] = ((n + (n >> 8)) >> 8) as u8;
-                            }
-                        }
-                        if swap {
-                            pixel.swap(0, 2);
-                        }
-                        let q = ((yy - top) as usize * width as usize + (xx - left) as usize) * 4;
-                        out.mapping[q..q + 4].copy_from_slice(&pixel);
-                    }
-                }
-            }
-        }
+        let out = decoder.region(raw)?.orient(self.orientation)?;
         Ok((
-            out.freeze(false)?,
+            out.freeze(swap)?,
             [l - f64::from(left), t - f64::from(top), r - l, b - t],
         ))
     }
@@ -462,7 +451,7 @@ fn strips(input: &Input, size: (u32, u32), rows: u32) -> Result<Pixels> {
         return Err("invalid TIFF strip height".into());
     }
     let stride = size.0 as usize * rows as usize * 4;
-    let mut decoder = Decoder::new(input.reader()?)?;
+    let mut decoder = Decoder::new(input.reader()?)?.with_limits(tiff_limits(usize::MAX));
     if decoder.dimensions()? != size
         || decoder.colortype()? != ColorType::RGB(8)
         || decoder.get_chunk_type() != ChunkType::Strip
@@ -480,18 +469,6 @@ fn strips(input: &Input, size: (u32, u32), rows: u32) -> Result<Pixels> {
         crate::image::expand_rgb(&bytes, target);
     }
     Ok(pixels)
-}
-
-fn tile_supported<R: BufRead + Seek>(d: &mut Decoder<R>) -> Result<bool> {
-    Ok(d.get_chunk_type() == ChunkType::Tile
-        && matches!(
-            d.colortype()?,
-            ColorType::RGB(8) | ColorType::RGBA(8) | ColorType::Gray(8)
-        )
-        && d.find_tag_unsigned::<u16>(Tag::PlanarConfiguration)?
-            .unwrap_or(1)
-            == 1
-        && d.find_tag_unsigned::<u16>(Tag::Orientation)?.unwrap_or(1) == 1)
 }
 
 pub fn neighbors(path: &Path) -> Vec<PathBuf> {
@@ -527,9 +504,6 @@ pub struct Animation {
 }
 impl Animation {
     pub fn new(source: Arc<Source>) -> Result<Self> {
-        if source.bytes() > 16 * 1024 * 1024 {
-            return Err("animation exceeds the frame memory budget".into());
-        }
         let (frames, count) = frames(&source)?;
         let remaining = match count {
             LoopCount::Infinite => None,
@@ -581,30 +555,23 @@ fn frames(source: &Source) -> Result<(Frames<'static>, LoopCount)> {
     {
         Some(ImageFormat::Gif) => {
             let mut d = image::codecs::gif::GifDecoder::new(reader)?;
-            d.set_limits(animation_limits())?;
+            d.set_limits(limits(usize::MAX))?;
             let n = d.loop_count();
             (d.into_frames(), n)
         }
         Some(ImageFormat::Png) => {
-            let mut d = image::codecs::png::PngDecoder::new(reader)?;
-            d.set_limits(animation_limits())?;
+            let d = image::codecs::png::PngDecoder::with_limits(reader, limits(usize::MAX))?;
             let d = d.apng()?;
             let n = d.loop_count();
             (d.into_frames(), n)
         }
         Some(ImageFormat::WebP) => {
             let mut d = image::codecs::webp::WebPDecoder::new(reader)?;
-            d.set_limits(animation_limits())?;
+            d.set_limits(limits(usize::MAX))?;
             let n = d.loop_count();
             (d.into_frames(), n)
         }
         _ => return Err("image is not animated".into()),
     };
     Ok((frames, count))
-}
-
-fn animation_limits() -> image::Limits {
-    let mut limits = image::Limits::default();
-    limits.max_alloc = Some(64 * 1024 * 1024);
-    limits
 }

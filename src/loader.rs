@@ -130,7 +130,7 @@ impl Worker {
                         {
                             Ok(cache.take().unwrap().2)
                         } else {
-                            Source::load(input, swap, 256 * 1024 * 1024)
+                            Source::load(input, swap, usize::MAX)
                         }
                     };
                     let result = (|| -> crate::Result<Option<Output>> {
@@ -190,15 +190,6 @@ impl Worker {
                                             .is_none_or(|a| !Arc::ptr_eq(&a.source, source));
                                     if reset {
                                         animations.remove(&job.id);
-                                        let bytes = animations
-                                            .values()
-                                            .map(|a| a.source.bytes())
-                                            .sum::<usize>();
-                                        if animations.len() >= 8
-                                            || bytes + source.bytes() > CACHE_BYTES
-                                        {
-                                            return Err("animation memory budget exhausted".into());
-                                        }
                                         animations.insert(job.id, Animation::new(source.clone())?);
                                     }
                                     delay = animations.get_mut(&job.id).unwrap().next(swap)?;
