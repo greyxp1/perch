@@ -13,8 +13,8 @@ use image::{
 };
 use std::{
     fs::{File, OpenOptions},
-    io::{BufRead, BufReader, Cursor, Seek, Write},
-    os::unix::fs::OpenOptionsExt,
+    io::{BufRead, BufReader, Read, Seek},
+    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -28,16 +28,10 @@ use tiff::{
 pub const CACHE_BYTES: usize = 64 * 1024 * 1024;
 trait Reader: BufRead + Seek {}
 impl<T: BufRead + Seek> Reader for T {}
-struct SharedBytes(Arc<Vec<u8>>);
-impl AsRef<[u8]> for SharedBytes {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
-    }
-}
 #[derive(Clone)]
 pub enum Input {
     Path(PathBuf),
-    Bytes(Arc<Vec<u8>>),
+    File(Arc<File>),
 }
 impl Input {
     fn file(&self) -> Result<File> {
@@ -52,21 +46,13 @@ impl Input {
                 }
                 Ok(file)
             }
-            Self::Bytes(bytes) => {
-                use nix::sys::memfd::{MFdFlags, memfd_create};
-                let mut file = File::from(memfd_create(c"perch-input", MFdFlags::MFD_CLOEXEC)?);
-                file.write_all(bytes)?;
-                file.rewind()?;
-                Ok(file)
-            }
+            Self::File(file) => Ok(File::open(format!("/proc/self/fd/{}", file.as_raw_fd()))?),
         }
     }
     fn reader(&self) -> Result<Box<dyn Reader + Send>> {
-        Ok(match self {
-            Self::Path(_) => Box::new(BufReader::new(self.file()?)),
-            Self::Bytes(bytes) => Box::new(Cursor::new(SharedBytes(bytes.clone()))),
-        })
+        Ok(Box::new(BufReader::new(self.file()?)))
     }
+
     pub fn path(&self) -> Option<&Path> {
         match self {
             Self::Path(p) => Some(p),
@@ -80,8 +66,17 @@ pub struct Source {
     pub size: (u32, u32),
     pub animated: bool,
     orientation: Orientation,
-    pub frame: Option<Mutex<Arc<Frame>>>,
-    tiles: Option<Vec<Level>>,
+    data: Data,
+}
+enum Data {
+    Raster {
+        frame: Arc<Frame>,
+        format: Option<ImageFormat>,
+    },
+    Tiff {
+        levels: Vec<Level>,
+        overview: Mutex<Option<Arc<Frame>>>,
+    },
 }
 struct Level {
     offset: u64,
@@ -98,7 +93,12 @@ pub struct View {
     pub span_height: f64,
 }
 impl Source {
-    pub fn load(input: Input, swap: bool, limit: usize) -> Result<Arc<Self>> {
+    pub fn load(
+        input: Input,
+        swap: bool,
+        limit: usize,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Arc<Self>> {
         let mut reader = input.reader()?;
         let format = ImageReader::new(&mut reader)
             .with_guessed_format()?
@@ -106,7 +106,11 @@ impl Source {
             .or_else(|| input.path().and_then(|p| ImageFormat::from_path(p).ok()));
         if format == Some(ImageFormat::Tiff) {
             if let Ok(mut native) = Tiff::open(input.file()?)
-                && native.tiled()
+                && native.readable()
+                && (native.tiled() || {
+                    let (w, h) = native.dimensions()?;
+                    u64::from(w) * u64::from(h) > crate::RENDER_BYTES as u64 / 8
+                })
             {
                 let raw_size = native.dimensions()?;
                 let orientation = Orientation::from_exif(native.orientation().try_into()?)
@@ -115,10 +119,13 @@ impl Source {
                 let mut pending = vec![(native.offset(), false)];
                 let mut visited = std::collections::HashSet::from([native.offset()]);
                 while let Some((offset, subifd)) = pending.pop() {
+                    if cancelled() {
+                        return Err("image loading cancelled".into());
+                    }
                     native.seek(offset)?;
                     let (w, h) = native.dimensions()?;
                     if (levels.is_empty() || subifd || native.reduced())
-                        && native.tiled()
+                        && native.readable()
                         && native.orientation() == u16::from(orientation.to_exif())
                         && w <= raw_size.0
                         && h <= raw_size.1
@@ -159,8 +166,10 @@ impl Source {
                     size,
                     animated: false,
                     orientation,
-                    frame: None,
-                    tiles: Some(levels),
+                    data: Data::Tiff {
+                        levels,
+                        overview: Mutex::new(None),
+                    },
                 }));
             }
             let mut tiff = Decoder::new(&mut reader)?.with_limits(tiff_limits(limit));
@@ -192,7 +201,7 @@ impl Source {
                     strips(&input, size, rows)?
                 }
                 .orient(orientation)?;
-                return Self::pixels(input, pixels, false, swap);
+                return Self::pixels(input, pixels, false, swap, Some(ImageFormat::Tiff));
             }
             drop(tiff);
             reader.rewind()?;
@@ -211,9 +220,17 @@ impl Source {
                 decoder.is_apng()?
             }
             Some(ImageFormat::WebP) => {
-                let decoder = image::codecs::webp::WebPDecoder::new(&mut reader)?;
-                dimensions(decoder.dimensions())?;
-                decoder.has_animation()
+                let mut header = [0; 64];
+                let length = reader.read(&mut header)?;
+                if let Ok((size, animated)) = crate::image::webp_info(&header[..length]) {
+                    dimensions(size)?;
+                    animated
+                } else {
+                    reader.rewind()?;
+                    let decoder = image::codecs::webp::WebPDecoder::new(&mut reader)?;
+                    dimensions(decoder.dimensions())?;
+                    decoder.has_animation()
+                }
             }
             Some(format) => {
                 let mut reader = ImageReader::with_format(&mut reader, format);
@@ -225,17 +242,29 @@ impl Source {
             None => false,
         };
         reader.rewind()?;
-        let pixels = Pixels::load(reader, input.path().map(Path::to_path_buf), limit)?;
-        Self::pixels(input, pixels, animated, swap)
+        let pixels = Pixels::load(
+            reader,
+            input.path().map(Path::to_path_buf),
+            limit,
+            cancelled,
+        )?;
+        Self::pixels(input, pixels, animated, swap, format)
     }
-    fn pixels(input: Input, pixels: Pixels, animated: bool, swap: bool) -> Result<Arc<Self>> {
+    fn pixels(
+        input: Input,
+        pixels: Pixels,
+        animated: bool,
+        swap: bool,
+        format: Option<ImageFormat>,
+    ) -> Result<Arc<Self>> {
         let size = pixels.original_size;
-        let input = match input {
-            Input::Bytes(_) if !animated && size == (pixels.width as u32, pixels.height as u32) => {
-                Input::Bytes(Arc::default())
-            }
-            input => input,
-        };
+        if !animated
+            && size == (pixels.width as u32, pixels.height as u32)
+            && let Input::File(file) = &input
+        {
+            // A complete still frame never needs its private encoded spool again.
+            file.set_len(0)?;
+        }
         let orientation = pixels.orientation;
         let frame = pixels.freeze(swap)?;
         Ok(Arc::new(Self {
@@ -243,28 +272,18 @@ impl Source {
             size,
             animated,
             orientation,
-            frame: Some(Mutex::new(frame)),
-            tiles: None,
+            data: Data::Raster { frame, format },
         }))
     }
     pub fn path(&self) -> Option<&Path> {
         self.input.path()
     }
     pub fn bytes(&self) -> usize {
-        self.frame.as_ref().map_or(0, |f| f.lock().unwrap().bytes())
-    }
-    pub fn region_only(&self) -> bool {
-        self.tiles.as_ref().is_some_and(|levels| {
-            let l = levels.last().unwrap();
-            (u64::from(l.width) * u64::from(l.height)).saturating_mul(4)
-                > crate::RENDER_BYTES as u64 / 2
-        })
-    }
-    pub fn min_zoom(&self, size: (i32, i32)) -> f64 {
-        if self.region_only() {
-            ((f64::from(size.0) * f64::from(size.1) * 8.0) / crate::RENDER_BYTES as f64).sqrt()
-        } else {
-            0.0
+        match &self.data {
+            Data::Raster { frame, .. } => frame.bytes(),
+            Data::Tiff { overview, .. } => {
+                overview.lock().unwrap().as_ref().map_or(0, |f| f.bytes())
+            }
         }
     }
     pub fn render(
@@ -272,6 +291,7 @@ impl Source {
         view: View,
         animation: Option<&Arc<Frame>>,
         swap: bool,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<Arc<Frame>> {
         let (sw, sh) = (f64::from(self.size.0), f64::from(self.size.1));
         let l = view.left.max(0.0);
@@ -297,33 +317,28 @@ impl Source {
         if w == 0 || h == 0 {
             return Pixels::new(view.width.try_into()?, view.height.try_into()?)?.freeze(false);
         }
-        let (frame, mut crop) = if let Some(levels) = &self.tiles {
-            self.region(levels, (l, t, r, b), (w, h), swap)?
+        let (frame, crop) = if let Data::Tiff { levels, overview } = &self.data {
+            self.region(levels, overview, (l, t, r, b), (w, h), swap, cancelled)?
         } else {
             let frame = if let Some(frame) = animation {
                 frame.clone()
             } else {
-                let mut frame = self
-                    .frame
-                    .as_ref()
-                    .ok_or("missing image pixels")?
-                    .lock()
-                    .unwrap();
+                let Data::Raster { frame, format } = &self.data else {
+                    unreachable!()
+                };
                 let required = (f64::from(view.width) / view.span_width)
                     .max(f64::from(view.height) / view.span_height)
                     .min(1.0);
                 let scale = (f64::from(frame.width) / sw).min(f64::from(frame.height) / sh);
                 if scale + 1e-8 < required {
-                    let pixels = Pixels::native(
-                        self.input.reader()?,
-                        ImageFormat::Jpeg,
-                        usize::MAX,
-                        (sw.max(sh) * required).ceil() as u32,
-                    )?;
-                    if pixels.original_size != self.size {
-                        return Err("image changed while open".into());
-                    }
-                    *frame = pixels.freeze(swap)?;
+                    return self.raster_region(
+                        view,
+                        (l, t, r, b),
+                        (x, y, w, h),
+                        swap,
+                        cancelled,
+                        format.unwrap_or(ImageFormat::Jpeg),
+                    );
                 }
                 frame.clone()
             };
@@ -331,59 +346,93 @@ impl Source {
             let sy = f64::from(frame.height) / sh;
             (frame, [l * sx, t * sy, (r - l) * sx, (b - t) * sy])
         };
-        crop[0] = crop[0].clamp(0.0, f64::from(frame.width));
-        crop[1] = crop[1].clamp(0.0, f64::from(frame.height));
-        crop[2] = crop[2].min(f64::from(frame.width) - crop[0]);
-        crop[3] = crop[3].min(f64::from(frame.height) - crop[1]);
-        if x == 0
-            && y == 0
-            && w == view.width
-            && h == view.height
-            && crop == [0.0, 0.0, f64::from(frame.width), f64::from(frame.height)]
-            && w == frame.width as u32
-            && h == frame.height as u32
-        {
-            return Ok(frame);
-        }
-        let mut out = Pixels::new(view.width.try_into()?, view.height.try_into()?)?;
-        let data = frame.map()?;
-        let source = ImageRef::new(frame.width as u32, frame.height as u32, &data, U8x4)?;
-        let options = ResizeOptions::new()
-            .crop(crop[0], crop[1], crop[2], crop[3])
-            .use_alpha(false);
-        if x == 0 && y == 0 && w == view.width && h == view.height {
-            Resizer::new().resize(
-                &source,
-                &mut Image::from_slice_u8(w, h, &mut out.mapping, U8x4)?,
-                &options,
-            )?;
+        render_frame(frame, crop, view, (x, y, w, h))
+    }
+    fn raster_region(
+        &self,
+        view: View,
+        rect: (f64, f64, f64, f64),
+        destination: (u32, u32, u32, u32),
+        swap: bool,
+        cancelled: &dyn Fn() -> bool,
+        format: ImageFormat,
+    ) -> Result<Arc<Frame>> {
+        let (l, t, r, b) = rect;
+        let (_, _, w, h) = destination;
+        let halo = (3.0 * ((r - l) / f64::from(w)).max((b - t) / f64::from(h))).ceil() + 1.0;
+        let (left, top, right, bottom) = (
+            (l - halo).floor().max(0.0) as u32,
+            (t - halo).floor().max(0.0) as u32,
+            (r + halo).ceil().min(f64::from(self.size.0)) as u32,
+            (b + halo).ceil().min(f64::from(self.size.1)) as u32,
+        );
+        let rotated = self.orientation.to_exif() >= 5;
+        let raw_size = if rotated {
+            (self.size.1, self.size.0)
         } else {
-            let mut tile = vec![0; (w as usize) * (h as usize) * 4];
-            Resizer::new().resize(
-                &source,
-                &mut Image::from_slice_u8(w, h, &mut tile, U8x4)?,
-                &options,
-            )?;
-            for row in 0..h as usize {
-                let start = ((y as usize + row) * view.width as usize + x as usize) * 4;
-                out.mapping[start..start + w as usize * 4]
-                    .copy_from_slice(&tile[row * w as usize * 4..(row + 1) * w as usize * 4]);
-            }
+            self.size
+        };
+        let mut raw = raw_rect((left, top, right, bottom), raw_size, self.orientation);
+        let (left, top, right, bottom) = if format == ImageFormat::WebP {
+            raw.0 &= !1;
+            raw.1 &= !1;
+            let inverse = Orientation::from_exif(match self.orientation.to_exif() {
+                6 => 8,
+                8 => 6,
+                x => x,
+            })
+            .unwrap();
+            raw_rect(raw, self.size, inverse)
+        } else {
+            (left, top, right, bottom)
+        };
+        let raw_span = (raw.2 - raw.0, raw.3 - raw.1);
+        let target = if (u64::from(raw_span.0) * u64::from(raw_span.1)).saturating_mul(4)
+            > crate::RENDER_BYTES as u64 / 2
+        {
+            crate::overview::fit(raw_span, w.max(h))
+        } else {
+            raw_span
+        };
+        let pixels = if format == ImageFormat::Png {
+            Pixels::png_region(self.input.reader()?, raw_size, raw, target, cancelled)?
+        } else {
+            Pixels::encoded_region(
+                self.input.reader()?,
+                format,
+                raw_size,
+                raw,
+                target,
+                cancelled,
+            )?
+        };
+        if pixels.original_size != self.size || pixels.orientation != self.orientation {
+            return Err("image changed while open".into());
         }
-        // Negative filter lobes must not produce invalid premultiplied colors.
-        for p in out.mapping.as_chunks_mut::<4>().0 {
-            for c in 0..3 {
-                p[c] = p[c].min(p[3]);
-            }
-        }
-        out.freeze(false)
+        let (sx, sy) = (
+            f64::from(pixels.width) / f64::from(right - left),
+            f64::from(pixels.height) / f64::from(bottom - top),
+        );
+        render_frame(
+            pixels.freeze(swap)?,
+            [
+                (l - f64::from(left)) * sx,
+                (t - f64::from(top)) * sy,
+                (r - l) * sx,
+                (b - t) * sy,
+            ],
+            view,
+            destination,
+        )
     }
     fn region(
         &self,
         levels: &[Level],
+        overview: &Mutex<Option<Arc<Frame>>>,
         rect: (f64, f64, f64, f64),
         output: (u32, u32),
         swap: bool,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<(Arc<Frame>, [f64; 4])> {
         let rotated = self.orientation.to_exif() >= 5;
         let logical = |level: &Level| {
@@ -416,29 +465,59 @@ impl Source {
         let right = (r + halo).ceil().min(f64::from(lw)) as u32;
         let bottom = (b + halo).ceil().min(f64::from(lh)) as u32;
         let (width, height) = (right - left, bottom - top);
-        if (u64::from(width) * u64::from(height)).saturating_mul(4) > crate::RENDER_BYTES as u64 {
-            return Err("TIFF region is too large".into());
-        }
         let (w, h) = (level.width, level.height);
-        let raw = match self.orientation.to_exif() {
-            2 => (w - right, top, w - left, bottom),
-            3 => (w - right, h - bottom, w - left, h - top),
-            4 => (left, h - bottom, right, h - top),
-            5 => (top, left, bottom, right),
-            6 => (top, h - right, bottom, h - left),
-            7 => (w - bottom, h - right, w - top, h - left),
-            8 => (w - bottom, left, w - top, right),
-            _ => (left, top, right, bottom),
-        };
+        let raw = raw_rect((left, top, right, bottom), (w, h), self.orientation);
         let mut decoder = Tiff::open(self.input.file()?)?;
         decoder.seek(level.offset)?;
         if decoder.dimensions()? != (w, h)
-            || !decoder.tiled()
+            || !decoder.readable()
             || decoder.orientation() != u16::from(self.orientation.to_exif())
         {
             return Err("TIFF changed while open".into());
         }
-        let out = decoder.region(raw)?.orient(self.orientation)?;
+        let out = if (u64::from(width) * u64::from(height)).saturating_mul(4)
+            > crate::RENDER_BYTES as u64 / 2
+        {
+            let mut cached = overview.lock().unwrap();
+            let full = rect == (0.0, 0.0, f64::from(self.size.0), f64::from(self.size.1));
+            if full
+                && let Some(frame) = cached.as_ref()
+                && frame.width as u32 >= output.0
+                && frame.height as u32 >= output.1
+            {
+                return Ok((
+                    frame.clone(),
+                    [0.0, 0.0, f64::from(frame.width), f64::from(frame.height)],
+                ));
+            }
+            let size = if rotated {
+                (output.1, output.0)
+            } else {
+                output
+            };
+            let out = decoder
+                .overview(raw, size, cancelled)?
+                .orient(self.orientation)?;
+            let (sx, sy) = (
+                f64::from(out.width) / f64::from(width),
+                f64::from(out.height) / f64::from(height),
+            );
+            let frame = out.freeze(swap)?;
+            if full {
+                *cached = Some(frame.clone());
+            }
+            return Ok((
+                frame,
+                [
+                    (l - f64::from(left)) * sx,
+                    (t - f64::from(top)) * sy,
+                    (r - l) * sx,
+                    (b - t) * sy,
+                ],
+            ));
+        } else {
+            decoder.region(raw, cancelled)?.orient(self.orientation)?
+        };
         Ok((
             out.freeze(swap)?,
             [l - f64::from(left), t - f64::from(top), r - l, b - t],
@@ -574,4 +653,78 @@ fn frames(source: &Source) -> Result<(Frames<'static>, LoopCount)> {
         _ => return Err("image is not animated".into()),
     };
     Ok((frames, count))
+}
+
+fn render_frame(
+    frame: Arc<Frame>,
+    mut crop: [f64; 4],
+    view: View,
+    destination: (u32, u32, u32, u32),
+) -> Result<Arc<Frame>> {
+    let (x, y, w, h) = destination;
+    crop[0] = crop[0].clamp(0.0, f64::from(frame.width));
+    crop[1] = crop[1].clamp(0.0, f64::from(frame.height));
+    crop[2] = crop[2].min(f64::from(frame.width) - crop[0]);
+    crop[3] = crop[3].min(f64::from(frame.height) - crop[1]);
+    if x == 0
+        && y == 0
+        && w == view.width
+        && h == view.height
+        && crop == [0.0, 0.0, f64::from(frame.width), f64::from(frame.height)]
+        && w == frame.width as u32
+        && h == frame.height as u32
+    {
+        return Ok(frame);
+    }
+    let mut out = Pixels::new(view.width.try_into()?, view.height.try_into()?)?;
+    let data = frame.map()?;
+    let source = ImageRef::new(frame.width as u32, frame.height as u32, &data, U8x4)?;
+    let options = ResizeOptions::new()
+        .crop(crop[0], crop[1], crop[2], crop[3])
+        .use_alpha(false);
+    if x == 0 && y == 0 && w == view.width && h == view.height {
+        Resizer::new().resize(
+            &source,
+            &mut Image::from_slice_u8(w, h, &mut out.mapping, U8x4)?,
+            &options,
+        )?;
+    } else {
+        let mut tile = vec![0; (w as usize) * (h as usize) * 4];
+        Resizer::new().resize(
+            &source,
+            &mut Image::from_slice_u8(w, h, &mut tile, U8x4)?,
+            &options,
+        )?;
+        for row in 0..h as usize {
+            let start = ((y as usize + row) * view.width as usize + x as usize) * 4;
+            out.mapping[start..start + w as usize * 4]
+                .copy_from_slice(&tile[row * w as usize * 4..(row + 1) * w as usize * 4]);
+        }
+    }
+    // Negative filter lobes must not produce invalid premultiplied colors.
+    for p in out.mapping.as_chunks_mut::<4>().0 {
+        for c in 0..3 {
+            p[c] = p[c].min(p[3]);
+        }
+    }
+    out.freeze(false)
+}
+
+fn raw_rect(
+    rect: (u32, u32, u32, u32),
+    size: (u32, u32),
+    orientation: Orientation,
+) -> (u32, u32, u32, u32) {
+    let (left, top, right, bottom) = rect;
+    let (w, h) = size;
+    match orientation.to_exif() {
+        2 => (w - right, top, w - left, bottom),
+        3 => (w - right, h - bottom, w - left, h - top),
+        4 => (left, h - bottom, right, h - top),
+        5 => (top, left, bottom, right),
+        6 => (top, h - right, bottom, h - left),
+        7 => (w - bottom, h - right, w - top, h - left),
+        8 => (w - bottom, left, w - top, right),
+        _ => rect,
+    }
 }

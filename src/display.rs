@@ -133,8 +133,8 @@ impl Pin {
             (f64::from(self.source.size.0) * fit).round().max(1.0) as i32,
             (f64::from(self.source.size.1) * fit).round().max(1.0) as i32,
         );
-        self.inspect = self.source.region_only();
-        self.zoom = if self.inspect { 1.0 } else { fit };
+        self.inspect = false;
+        self.zoom = fit;
         self.center = (
             f64::from(self.source.size.0) / 2.0,
             f64::from(self.source.size.1) / 2.0,
@@ -205,12 +205,18 @@ impl Pin {
         let minimum = if self.inspect {
             (f64::from(self.size.0) / f64::from(self.source.size.0))
                 .min(f64::from(self.size.1) / f64::from(self.source.size.1))
-                .max(self.source.min_zoom(self.size))
         } else {
             0.05_f64.min(self.fit())
         };
         let old = self.zoom;
         self.zoom = (old * 1.1_f64.powf(-value / 15.0)).clamp(minimum, 8.0_f64.max(minimum));
+        if !self.inspect
+            && (f64::from(self.source.size.0) * self.zoom > f64::from(self.bounds.0)
+                || f64::from(self.source.size.1) * self.zoom > f64::from(self.bounds.1))
+        {
+            self.inspect = true;
+            self.title();
+        }
         if self.inspect {
             self.clamp_center();
         } else {
@@ -285,7 +291,7 @@ impl App {
     fn open_images(&mut self, images: ipc::Images, fd: OwnedFd) {
         let inputs = match images {
             ipc::Images::Paths(paths) => paths.into_iter().map(Input::Path).collect(),
-            ipc::Images::Stdin(bytes) => vec![Input::Bytes(Arc::new(bytes))],
+            ipc::Images::Stdin(file) => vec![Input::File(Arc::new(file))],
         };
         let id = self.id();
         self.pending.insert(
@@ -458,11 +464,9 @@ impl App {
                 pin.title();
             }
             keysyms::KEY_Tab => {
-                if !pin.source.region_only() {
-                    pin.inspect = !pin.inspect;
-                    if !pin.inspect {
-                        pin.zoom = f64::from(pin.size.0) / f64::from(pin.source.size.0);
-                    }
+                pin.inspect = !pin.inspect;
+                if !pin.inspect {
+                    pin.zoom = f64::from(pin.size.0) / f64::from(pin.source.size.0);
                 }
                 pin.center = (
                     f64::from(pin.source.size.0) / 2.0,
@@ -472,6 +476,13 @@ impl App {
                 pin.title();
             }
             keysyms::KEY_Home | keysyms::KEY_End => {
+                if key == keysyms::KEY_End
+                    && (u64::from(pin.source.size.0) > pin.bounds.0 as u64
+                        || u64::from(pin.source.size.1) > pin.bounds.1 as u64)
+                {
+                    pin.inspect = true;
+                    pin.title();
+                }
                 if pin.inspect {
                     pin.zoom = if key == keysyms::KEY_End {
                         1.0
@@ -479,7 +490,6 @@ impl App {
                         (f64::from(pin.size.0) / f64::from(pin.source.size.0))
                             .min(f64::from(pin.size.1) / f64::from(pin.source.size.1))
                     };
-                    pin.zoom = pin.zoom.max(pin.source.min_zoom(pin.size));
                     pin.center = (
                         f64::from(pin.source.size.0) / 2.0,
                         f64::from(pin.source.size.1) / 2.0,

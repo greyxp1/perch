@@ -1,21 +1,28 @@
 use crate::Result;
 use nix::{
     errno::Errno,
-    sys::socket::{self, AddressFamily, MsgFlags, SockFlag, SockType, UnixAddr},
+    sys::socket::{
+        self, AddressFamily, ControlMessage, ControlMessageOwned, MsgFlags, SockFlag, SockType,
+        UnixAddr,
+    },
     unistd::getuid,
 };
 use std::{
     env,
     ffi::OsString,
-    io::{self, Read},
+    fs::{File, OpenOptions},
+    io::{self, IoSlice, IoSliceMut},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
-        unix::ffi::{OsStrExt, OsStringExt},
+        unix::{
+            ffi::{OsStrExt, OsStringExt},
+            fs::OpenOptionsExt,
+        },
     },
     path::PathBuf,
 };
 
-const MAGIC: u32 = 0x50455243;
+const MAGIC: u32 = 0x50455244;
 const MAX_PATHS: usize = 4096;
 const MAX_PATH_SIZE: usize = 4096;
 pub const MAX_CLIENTS: usize = 16;
@@ -76,18 +83,67 @@ fn receive(fd: &OwnedFd, bytes: &mut [u8]) -> nix::Result<usize> {
     }
 }
 
+fn send_file(fd: &OwnedFd, file: &File) -> nix::Result<()> {
+    let rights = [file.as_raw_fd()];
+    loop {
+        match socket::sendmsg::<()>(
+            fd.as_raw_fd(),
+            &[IoSlice::new(&[0])],
+            &[ControlMessage::ScmRights(&rights)],
+            MsgFlags::MSG_NOSIGNAL,
+            None,
+        ) {
+            Err(Errno::EINTR) => continue,
+            Ok(1) => return Ok(()),
+            Ok(_) => return Err(Errno::EIO),
+            Err(error) => return Err(error),
+        }
+    }
+}
+fn receive_file(fd: &OwnedFd) -> Result<File> {
+    let mut marker = [1];
+    let mut iov = [IoSliceMut::new(&mut marker)];
+    let mut space = nix::cmsg_space!([i32; 1]);
+    let message = loop {
+        match socket::recvmsg::<()>(
+            fd.as_raw_fd(),
+            &mut iov,
+            Some(&mut space),
+            MsgFlags::MSG_CMSG_CLOEXEC,
+        ) {
+            Err(Errno::EINTR) => continue,
+            result => break result?,
+        }
+    };
+    let mut files: Vec<File> = message
+        .cmsgs()?
+        .flat_map(|control| match control {
+            ControlMessageOwned::ScmRights(fds) => fds,
+            _ => Vec::new(),
+        })
+        .map(|raw| {
+            // SCM_RIGHTS transfers ownership of each newly received descriptor.
+            unsafe { File::from_raw_fd(raw) }
+        })
+        .collect();
+    if message.bytes != 1 || files.len() != 1 || marker[0] != 0 {
+        return Err("daemon did not provide stdin storage".into());
+    }
+    Ok(files.remove(0))
+}
+
 enum Request {
     Header,
     Paths {
         expected: usize,
         paths: Vec<PathBuf>,
     },
-    Stdin(Vec<u8>),
+    Stdin(File),
 }
 
 pub enum Images {
     Paths(Vec<PathBuf>),
-    Stdin(Vec<u8>),
+    Stdin(File),
 }
 
 pub struct Client {
@@ -134,7 +190,14 @@ impl Client {
                     return Err("invalid request header".into());
                 }
                 self.request = if count == 0 {
-                    Request::Stdin(Vec::new())
+                    let file = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .mode(0o600)
+                        .custom_flags(nix::libc::O_TMPFILE)
+                        .open(env::temp_dir())?;
+                    send_file(&self.fd, &file)?;
+                    Request::Stdin(file)
                 } else {
                     Request::Paths {
                         expected: count,
@@ -150,19 +213,14 @@ impl Client {
                 paths.push(OsString::from_vec(packet[..size - 1].to_vec()).into());
                 Ok((paths.len() == *expected).then(|| Images::Paths(std::mem::take(paths))))
             }
-            Request::Stdin(bytes) => match (packet[0], size) {
-                (1, 2..) => {
-                    bytes.try_reserve(size - 1)?;
-                    bytes.extend_from_slice(&packet[1..size]);
-                    Ok(None)
-                }
+            Request::Stdin(_) => match (packet[0], size) {
                 (0, 1) => {
-                    let Request::Stdin(bytes) =
+                    let Request::Stdin(file) =
                         std::mem::replace(&mut self.request, Request::Header)
                     else {
                         unreachable!();
                     };
-                    Ok(Some(Images::Stdin(bytes)))
+                    Ok(Some(Images::Stdin(file)))
                 }
                 _ => Err("invalid stdin packet".into()),
             },
@@ -183,20 +241,11 @@ pub fn run_client(args: &[OsString]) -> Result<()> {
     header[4..].copy_from_slice(&(if from_stdin { 0 } else { args.len() as u32 }).to_ne_bytes());
     send(&fd, &header)?;
     if from_stdin {
-        let mut packet = [0; 4097];
-        let mut stdin = io::stdin().lock();
-        let mut size = stdin.read(&mut packet[1..])?;
-        if size == 0 {
+        let mut file = receive_file(&fd)?;
+        if io::copy(&mut io::stdin().lock(), &mut file)? == 0 {
             return Err("cannot open stdin: empty stream".into());
         }
-        loop {
-            packet[0] = u8::from(size != 0);
-            send(&fd, &packet[..size + 1])?;
-            if size == 0 {
-                break;
-            }
-            size = stdin.read(&mut packet[1..])?;
-        }
+        send(&fd, &[0])?;
     } else {
         for arg in args {
             let path = std::fs::canonicalize(arg).map_err(|error| {

@@ -65,6 +65,7 @@ impl Pixels {
         mut reader: impl BufRead + Seek,
         path: Option<PathBuf>,
         limit: usize,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<Self> {
         let format = ImageReader::new(&mut reader)
             .with_guessed_format()?
@@ -74,9 +75,9 @@ impl Pixels {
                     .and_then(|path| ImageFormat::from_path(path).ok())
             });
         match format {
-            Some(ImageFormat::Png) => Self::png(reader),
+            Some(ImageFormat::Png) => Self::png(reader, cancelled),
             Some(format @ (ImageFormat::Jpeg | ImageFormat::WebP)) => {
-                Self::native(reader, format, limit, 1920)
+                Self::native(reader, format, limit, 1920, cancelled)
             }
             Some(format) => {
                 let (image, orientation) = decode(reader, format, limit)?;
@@ -131,10 +132,18 @@ impl Pixels {
             }
         }
     }
-    fn png(reader: impl Read) -> Result<Self> {
+    fn png(reader: impl Read, cancelled: &dyn Fn() -> bool) -> Result<Self> {
         let mut decoder = spng::raw::RawContext::new()?;
         decoder.set_png_stream(reader)?;
         let info = decoder.get_ihdr()?;
+        if u64::from(info.width) * u64::from(info.height) * 4 > crate::RENDER_BYTES as u64 / 2 {
+            return Self::png_stream(
+                decoder,
+                (0, 0, info.width, info.height),
+                crate::overview::fit((info.width, info.height), 2048),
+                cancelled,
+            );
+        }
         let mut pixels = Self::new(info.width.try_into()?, info.height.try_into()?)?;
         decoder.decode_image(
             &mut pixels.mapping,
@@ -149,6 +158,209 @@ impl Pixels {
             .unwrap_or(Orientation::NoTransforms);
         pixels.premultiply()?;
         pixels.orient(orientation)
+    }
+    pub fn png_region(
+        reader: impl Read,
+        expected: (u32, u32),
+        rect: (u32, u32, u32, u32),
+        size: (u32, u32),
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Self> {
+        let mut decoder = spng::raw::RawContext::new()?;
+        decoder.set_png_stream(reader)?;
+        let info = decoder.get_ihdr()?;
+        if (info.width, info.height) != expected {
+            return Err("image changed while open".into());
+        }
+        Self::png_stream(decoder, rect, size, cancelled)
+    }
+    fn png_stream<R: Read>(
+        mut decoder: spng::raw::RawContext<R>,
+        rect: (u32, u32, u32, u32),
+        size: (u32, u32),
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Self> {
+        let info = decoder.get_ihdr()?;
+        let mut raster = crate::overview::Rasterizer::new(rect, size, info.interlace_method == 0)?;
+        let len = (info.width as usize)
+            .checked_mul(4)
+            .ok_or("PNG row is too large")?;
+        let mut row = Vec::new();
+        row.try_reserve_exact(len)?;
+        row.resize(len, 0);
+        decoder.decode_image(
+            &mut [],
+            spng::Format::Rgba8,
+            spng::DecodeFlags::TRANSPARENCY | spng::DecodeFlags::PROGRESSIVE,
+        )?;
+        loop {
+            if cancelled() {
+                return Err("image loading cancelled".into());
+            }
+            let row_info = decoder.get_row_info()?;
+            let done = match decoder.decode_row(&mut row) {
+                Ok(()) => false,
+                Err(spng::Error::Oi) => true,
+                Err(e) => return Err(e.into()),
+            };
+            let y = row_info.row_num;
+            if (rect.1..rect.3).contains(&y) {
+                let (start, step) = if info.interlace_method == 0 {
+                    (0, 1)
+                } else {
+                    let pass = usize::try_from(row_info.pass)?;
+                    (
+                        *[0, 4, 0, 2, 0, 1, 0].get(pass).ok_or("invalid PNG pass")?,
+                        *[8, 8, 4, 4, 2, 2, 1].get(pass).unwrap(),
+                    )
+                };
+                if step == 1 && info.interlace_method == 0 {
+                    let data = &mut row[rect.0 as usize * 4..rect.2 as usize * 4];
+                    MulDiv::default().multiply_alpha_inplace(&mut Image::from_slice_u8(
+                        rect.2 - rect.0,
+                        1,
+                        data,
+                        U8x4,
+                    )?)?;
+                    raster.row(rect.0, y, data)?;
+                } else {
+                    // Adam7 partitions pixels across passes. Retain only each pass's new pixels.
+                    let first = rect.0 + (start + step - rect.0 % step) % step;
+                    for x in (first..rect.2).step_by(step as usize) {
+                        let mut pixel: [u8; 4] =
+                            row[x as usize * 4..x as usize * 4 + 4].try_into().unwrap();
+                        for c in 0..3 {
+                            let n = u16::from(pixel[c]) * u16::from(pixel[3]) + 128;
+                            pixel[c] = ((n + (n >> 8)) >> 8) as u8;
+                        }
+                        raster.pixel(x, y, pixel)?;
+                    }
+                }
+            }
+            if done {
+                break;
+            }
+        }
+        decoder.decode_chunks()?;
+        let orientation = decoder
+            .get_exif()
+            .chunk_avail()?
+            .and_then(|exif| Orientation::from_exif_chunk(exif.data()))
+            .unwrap_or(Orientation::NoTransforms);
+        let mut pixels = raster.finish()?;
+        pixels.original_size = (info.width, info.height);
+        pixels.orient(orientation)
+    }
+    pub fn encoded_region(
+        mut reader: impl Read,
+        format: ImageFormat,
+        expected: (u32, u32),
+        rect: (u32, u32, u32, u32),
+        size: (u32, u32),
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Self> {
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes)?;
+        if cancelled() {
+            return Err("image loading cancelled".into());
+        }
+        let (dimensions, orientation) = encoded_info(&bytes, format)?;
+        if dimensions != expected {
+            return Err("image changed while open".into());
+        }
+        let mut pixels = if format == ImageFormat::Jpeg {
+            Self::jpeg_stream(&bytes, expected, 1, rect, size, cancelled)?
+        } else {
+            let mut pixels = Self::new(size.0.try_into()?, size.1.try_into()?)?;
+            let ok = unsafe {
+                perch_webp_scaled(
+                    bytes.as_ptr(),
+                    bytes.len(),
+                    pixels.mapping.as_mut_ptr(),
+                    pixels.mapping.len(),
+                    pixels.width,
+                    pixels.height,
+                    pixels.width * 4,
+                    rect.0 as i32,
+                    rect.1 as i32,
+                    (rect.2 - rect.0) as i32,
+                    (rect.3 - rect.1) as i32,
+                )
+            };
+            if ok == 0 {
+                return Err("cannot decode WebP region".into());
+            }
+            pixels.premultiply()?;
+            pixels
+        };
+        pixels.original_size = expected;
+        pixels.orient(orientation)
+    }
+    fn jpeg_stream(
+        bytes: &[u8],
+        expected: (u32, u32),
+        denominator: u32,
+        rect: (u32, u32, u32, u32),
+        size: (u32, u32),
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Self> {
+        struct Rows<'a> {
+            raster: crate::overview::Rasterizer,
+            cancelled: &'a dyn Fn() -> bool,
+            error: Option<Box<dyn std::error::Error>>,
+        }
+        extern "C" fn row(
+            context: *mut nix::libc::c_void,
+            x: u32,
+            y: u32,
+            data: *const u8,
+            width: u32,
+        ) -> i32 {
+            // The decoder calls synchronously, and its row is borrowed only for this call.
+            let rows = unsafe { &mut *context.cast::<Rows<'_>>() };
+            if (rows.cancelled)() {
+                rows.error = Some("image loading cancelled".into());
+                return 0;
+            }
+            if width == 0 {
+                return 1;
+            }
+            let pixels = unsafe { std::slice::from_raw_parts(data, width as usize * 4) };
+            if let Err(error) = rows.raster.row(x, y, pixels) {
+                rows.error = Some(error);
+                return 0;
+            }
+            1
+        }
+        let mut rows = Rows {
+            raster: crate::overview::Rasterizer::new(rect, size, true)?,
+            cancelled,
+            error: None,
+        };
+        let ok = unsafe {
+            perch_jpeg_rows(
+                bytes.as_ptr(),
+                bytes.len(),
+                expected.0,
+                expected.1,
+                denominator,
+                rect.0,
+                rect.1,
+                rect.2,
+                rect.3,
+                row,
+                (&mut rows as *mut Rows<'_>).cast(),
+            )
+        };
+        if let Some(error) = rows.error {
+            return Err(error);
+        }
+        if ok == 0 {
+            return Err("cannot decode JPEG region".into());
+        }
+        let mut out = rows.raster.finish()?;
+        out.original_size = expected;
+        Ok(out)
     }
     fn premultiply(&mut self) -> Result<()> {
         MulDiv::default().multiply_alpha_inplace(&mut Image::from_slice_u8(
@@ -188,13 +400,11 @@ impl Pixels {
         format: ImageFormat,
         limit: usize,
         max_side: u32,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<Self> {
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes)?;
-        let mut decoder = ImageReader::with_format(Cursor::new(&bytes), format).into_decoder()?;
-        let (w, h) = decoder.dimensions();
-        let orientation = decoder.orientation()?;
-        drop(decoder);
+        let ((w, h), orientation) = encoded_info(&bytes, format)?;
         if u64::from(w) * u64::from(h) * 4 > limit as u64 {
             return Err("image exceeds the decoded memory budget".into());
         }
@@ -219,22 +429,57 @@ impl Pixels {
                     .min_by_key(|(x, y)| u64::from(*x) * u64::from(*y))
                     .unwrap_or((w, h))
             }
+        } else if u64::from(w) * u64::from(h) * 4 > crate::RENDER_BYTES as u64 / 2 {
+            crate::overview::fit((w, h), max_side)
         } else {
             (w, h)
         };
+        if format == ImageFormat::Jpeg
+            && u64::from(width) * u64::from(height) * 4 > crate::RENDER_BYTES as u64 / 2
+        {
+            let scaled = (w.div_ceil(8), h.div_ceil(8));
+            match Self::jpeg_stream(
+                &bytes,
+                (w, h),
+                8,
+                (0, 0, scaled.0, scaled.1),
+                crate::overview::fit(scaled, 2048),
+                cancelled,
+            ) {
+                Ok(out) => return out.orient(orientation),
+                Err(error) if cancelled() => return Err(error),
+                Err(_) => {}
+            }
+        }
         let mut pixels = Self::new(width.try_into()?, height.try_into()?)?;
         pixels.original_size = (w, h);
         // Both codecs receive immutable input and a checked, full-size writable RGBA buffer.
         let decoded = unsafe {
             if format == ImageFormat::WebP {
-                !WebPDecodeRGBAInto(
-                    bytes.as_ptr(),
-                    bytes.len(),
-                    pixels.mapping.as_mut_ptr(),
-                    pixels.mapping.len(),
-                    pixels.width * 4,
-                )
-                .is_null()
+                if (width, height) != (w, h) {
+                    perch_webp_scaled(
+                        bytes.as_ptr(),
+                        bytes.len(),
+                        pixels.mapping.as_mut_ptr(),
+                        pixels.mapping.len(),
+                        pixels.width,
+                        pixels.height,
+                        pixels.width * 4,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ) != 0
+                } else {
+                    !WebPDecodeRGBAInto(
+                        bytes.as_ptr(),
+                        bytes.len(),
+                        pixels.mapping.as_mut_ptr(),
+                        pixels.mapping.len(),
+                        pixels.width * 4,
+                    )
+                    .is_null()
+                }
             } else {
                 let handle = tjInitDecompress();
                 if handle.is_null() {
@@ -315,6 +560,52 @@ impl Pixels {
         }
         Ok(pixels)
     }
+}
+
+fn encoded_info(bytes: &[u8], format: ImageFormat) -> Result<((u32, u32), Orientation)> {
+    Ok(if format == ImageFormat::WebP {
+        let (size, _) = webp_info(bytes)?;
+        let mut orientation = Orientation::NoTransforms;
+        let mut offset = 12_usize;
+        let end = bytes
+            .get(4..8)
+            .map(|n| u32::from_le_bytes(n.try_into().unwrap()) as usize + 8)
+            .ok_or("invalid WebP header")?
+            .min(bytes.len());
+        while let Some(header) = bytes
+            .get(offset..offset.saturating_add(8))
+            .filter(|_| offset + 8 <= end)
+        {
+            let length = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+            let next = offset
+                .checked_add(8)
+                .and_then(|n| n.checked_add(length))
+                .filter(|n| *n <= end)
+                .ok_or("invalid WebP chunk")?;
+            if &header[..4] == b"EXIF" {
+                orientation = Orientation::from_exif_chunk(&bytes[offset + 8..next])
+                    .unwrap_or(Orientation::NoTransforms);
+            }
+            offset = next.checked_add(length & 1).ok_or("invalid WebP chunk")?;
+        }
+        (size, orientation)
+    } else {
+        let mut header = ImageReader::with_format(Cursor::new(bytes), format);
+        header.no_limits();
+        let mut decoder = header.into_decoder()?;
+        (decoder.dimensions(), decoder.orientation()?)
+    })
+}
+
+pub fn webp_info(bytes: &[u8]) -> Result<((u32, u32), bool)> {
+    let (mut w, mut h, mut animated) = (0, 0, 0);
+    if unsafe { perch_webp_info(bytes.as_ptr(), bytes.len(), &mut w, &mut h, &mut animated) } == 0
+        || w <= 0
+        || h <= 0
+    {
+        return Err("invalid WebP header".into());
+    }
+    Ok(((w as u32, h as u32), animated != 0))
 }
 
 pub fn limits(bytes: usize) -> image::Limits {
@@ -453,6 +744,39 @@ impl Pixels {
 
 #[link(name = "webpdecoder", kind = "static")]
 unsafe extern "C" {
+    fn perch_jpeg_rows(
+        input: *const u8,
+        length: usize,
+        width: u32,
+        height: u32,
+        denominator: u32,
+        left: u32,
+        top: u32,
+        right: u32,
+        bottom: u32,
+        row: extern "C" fn(*mut nix::libc::c_void, u32, u32, *const u8, u32) -> i32,
+        context: *mut nix::libc::c_void,
+    ) -> i32;
+    fn perch_webp_info(
+        input: *const u8,
+        length: usize,
+        width: *mut i32,
+        height: *mut i32,
+        animated: *mut i32,
+    ) -> i32;
+    fn perch_webp_scaled(
+        input: *const u8,
+        length: usize,
+        output: *mut u8,
+        size: usize,
+        width: i32,
+        height: i32,
+        stride: i32,
+        left: i32,
+        top: i32,
+        width_crop: i32,
+        height_crop: i32,
+    ) -> i32;
     fn WebPDecodeRGBAInto(
         input: *const u8,
         length: usize,
@@ -501,6 +825,20 @@ pub fn native_tiff(compression: u16) -> bool {
     unsafe { TIFFIsCODECConfigured(compression) != 0 }
 }
 
+struct Chunk<'a> {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub solid: Option<[u8; 4]>,
+    data: &'a [u32],
+}
+impl Chunk<'_> {
+    pub fn row(&self, y: u32) -> &[u32] {
+        let offset = (self.height - 1 - (y - self.y)) as usize * self.width as usize;
+        &self.data[offset..offset + self.width as usize]
+    }
+}
 pub struct Tiff(*mut nix::libc::c_void);
 impl Drop for Tiff {
     fn drop(&mut self) {
@@ -569,18 +907,211 @@ impl Tiff {
         kind & 1 != 0
     }
     pub fn tiled(&self) -> bool {
-        let mut message = [0_i8; 1024];
-        unsafe { TIFFIsTiled(self.0) == 1 && TIFFRGBAImageOK(self.0, message.as_mut_ptr()) == 1 }
+        unsafe { TIFFIsTiled(self.0) != 0 }
     }
-    pub fn region(&mut self, rect: (u32, u32, u32, u32)) -> Result<Pixels> {
+    pub fn readable(&self) -> bool {
+        let mut message = [0_i8; 1024];
+        let mut compression = 1_u16;
+        unsafe {
+            TIFFGetField(self.0, 259, &mut compression);
+            TIFFIsCODECConfigured(compression) != 0
+                && TIFFRGBAImageOK(self.0, message.as_mut_ptr()) == 1
+        }
+    }
+    pub fn region(
+        &mut self,
+        rect: (u32, u32, u32, u32),
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Pixels> {
         let (left, top, right, bottom) = rect;
-        let (mut tw, mut th) = (0_u32, 0_u32);
-        if unsafe {
-            TIFFGetField(self.0, 322, &mut tw) != 1 || TIFFGetField(self.0, 323, &mut th) != 1
-        } || tw == 0
-            || th == 0
-        {
-            return Err("invalid TIFF tile dimensions".into());
+        let mut out = Pixels::new((right - left).try_into()?, (bottom - top).try_into()?)?;
+        self.visit(rect, cancelled, |tile| {
+            for y in tile.y.max(top)..tile.y.saturating_add(tile.height).min(bottom) {
+                let start = tile.x.max(left);
+                let end = tile.x.saturating_add(tile.width).min(right);
+                let row = &tile.row(y)[(start - tile.x) as usize..(end - tile.x) as usize];
+                let offset =
+                    ((y - top) as usize * (right - left) as usize + (start - left) as usize) * 4;
+                for (src, dst) in row.iter().zip(
+                    out.mapping[offset..offset + row.len() * 4]
+                        .as_chunks_mut::<4>()
+                        .0,
+                ) {
+                    dst.copy_from_slice(&src.to_le_bytes());
+                }
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+    pub fn overview(
+        &mut self,
+        rect: (u32, u32, u32, u32),
+        size: (u32, u32),
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Pixels> {
+        let mut overview = crate::overview::Overview::new(rect, size, !self.tiled())?;
+        let mut row = Vec::new();
+        self.visit(rect, cancelled, |tile| {
+            if let Some(pixel) = tile.solid {
+                overview.solid(
+                    (
+                        tile.x,
+                        tile.y,
+                        tile.x.saturating_add(tile.width),
+                        tile.y.saturating_add(tile.height),
+                    ),
+                    pixel,
+                );
+            } else {
+                row.resize(tile.width as usize * 4, 0);
+                for y in tile.y.max(rect.1)..tile.y.saturating_add(tile.height).min(rect.3) {
+                    for (src, dst) in tile.row(y).iter().zip(row.as_chunks_mut::<4>().0) {
+                        dst.copy_from_slice(&src.to_le_bytes());
+                    }
+                    overview.row(tile.x, y, &row)?;
+                }
+            }
+            Ok(())
+        })?;
+        overview.finish()
+    }
+    fn scanlines(
+        &mut self,
+        rect: (u32, u32, u32, u32),
+        rows: u32,
+        cancelled: &dyn Fn() -> bool,
+        visit: &mut impl FnMut(Chunk<'_>) -> Result<()>,
+    ) -> Result<bool> {
+        let (mut bits, mut samples, mut photo, mut planar, mut sample_format) =
+            (1_u16, 1_u16, 0_u16, 1_u16, 1_u16);
+        unsafe {
+            TIFFGetField(self.0, 258, &mut bits);
+            TIFFGetField(self.0, 277, &mut samples);
+            TIFFGetField(self.0, 262, &mut photo);
+            TIFFGetField(self.0, 284, &mut planar);
+            TIFFGetField(self.0, 339, &mut sample_format);
+        }
+        let colors = if photo == 2 { 3 } else { 1 };
+        let alpha = if samples == colors + 1 {
+            let mut count = 0_u16;
+            let mut values: *const u16 = std::ptr::null();
+            if unsafe { TIFFGetField(self.0, 338, &mut count, &mut values) } != 1
+                || count != 1
+                || values.is_null()
+            {
+                return Ok(false);
+            }
+            let kind = unsafe { *values };
+            if !matches!(kind, 1 | 2) {
+                return Ok(false);
+            }
+            kind
+        } else if samples == colors {
+            0
+        } else {
+            return Ok(false);
+        };
+        if planar != 1 || sample_format != 1 || !matches!(bits, 8 | 16) || photo > 2 {
+            return Ok(false);
+        }
+        let width = self.dimensions()?.0;
+        let stride = usize::from(samples) * usize::from(bits / 8);
+        let len = (width as usize)
+            .checked_mul(stride)
+            .ok_or("TIFF row is too large")?;
+        let mut row = Vec::new();
+        row.try_reserve_exact(len)?;
+        row.resize(len, 0_u8);
+        let mut rgba = Vec::new();
+        rgba.try_reserve_exact(width as usize)?;
+        rgba.resize(width as usize, 0_u32);
+        for y in rect.1 / rows * rows..rect.3 {
+            if cancelled() {
+                return Err("image loading cancelled".into());
+            }
+            if unsafe { TIFFReadScanline(self.0, row.as_mut_ptr().cast(), y, 0) } != 1 {
+                return Err("cannot decode TIFF row".into());
+            }
+            if y < rect.1 {
+                continue;
+            }
+            for (src, dst) in row.chunks_exact(stride).zip(&mut rgba) {
+                let sample = |c: usize| {
+                    if bits == 8 {
+                        src[c]
+                    } else {
+                        let n = u16::from_ne_bytes([src[c * 2], src[c * 2 + 1]]);
+                        if photo == 2 || c == colors as usize {
+                            ((u32::from(n) + 128) / 257) as u8
+                        } else {
+                            (n >> 8) as u8
+                        }
+                    }
+                };
+                let (r, g, b) = if colors == 3 {
+                    (sample(0), sample(1), sample(2))
+                } else {
+                    let g = if photo == 0 {
+                        255 - sample(0)
+                    } else {
+                        sample(0)
+                    };
+                    (g, g, g)
+                };
+                let a = if alpha == 0 {
+                    255
+                } else {
+                    sample(colors as usize)
+                };
+                let mut pixel = [r, g, b, a];
+                if alpha == 2 {
+                    for channel in &mut pixel[..3] {
+                        let n = u16::from(*channel) * u16::from(a) + 128;
+                        *channel = ((n + (n >> 8)) >> 8) as u8;
+                    }
+                }
+                *dst = u32::from_le_bytes(pixel);
+            }
+            let solid = rgba
+                .iter()
+                .all(|p| *p == rgba[0])
+                .then(|| rgba[0].to_le_bytes());
+            visit(Chunk {
+                x: 0,
+                y,
+                width,
+                height: 1,
+                solid,
+                data: &rgba,
+            })?;
+        }
+        Ok(true)
+    }
+    fn visit(
+        &mut self,
+        rect: (u32, u32, u32, u32),
+        cancelled: &dyn Fn() -> bool,
+        mut visit: impl FnMut(Chunk<'_>) -> Result<()>,
+    ) -> Result<()> {
+        let (left, top, right, bottom) = rect;
+        let (w, h) = self.dimensions()?;
+        let tiled = self.tiled();
+        let (mut tw, mut th, mut planar) = (w, h, 1_u16);
+        if tiled {
+            if unsafe {
+                TIFFGetField(self.0, 322, &mut tw) != 1 || TIFFGetField(self.0, 323, &mut th) != 1
+            } {
+                return Err("invalid TIFF tile dimensions".into());
+            }
+        } else {
+            unsafe {
+                TIFFGetField(self.0, 278, &mut th);
+            }
+            th = th.min(h);
+        }
+        if tw == 0 || th == 0 {
+            return Err("invalid TIFF chunk dimensions".into());
         }
         let bytes = u64::from(tw)
             .saturating_mul(u64::from(th))
@@ -588,34 +1119,93 @@ impl Tiff {
         if bytes > isize::MAX as u64 {
             return Err("TIFF tile is too large".into());
         }
-        let mut tile = vec![0_u32; (bytes / 4) as usize];
-        let mut out = Pixels::new((right - left).try_into()?, (bottom - top).try_into()?)?;
-        // libtiff returns associated RGBA in bottom-up tile rows. Orient the gathered region once.
+        if !tiled
+            && bytes > crate::RENDER_BYTES as u64 / 2
+            && self.scanlines(rect, th, cancelled, &mut visit)?
+        {
+            return Ok(());
+        }
+        let mut data = Vec::new();
+        data.try_reserve_exact((bytes / 4) as usize)?;
+        data.resize((bytes / 4) as usize, 0_u32);
+        // Raw chunks are bottom-up associated RGBA. The gathered region is oriented once.
         if unsafe { TIFFSetField(self.0, 274, 1_i32) } != 1 {
             return Err("invalid TIFF orientation".into());
         }
+        unsafe {
+            TIFFGetField(self.0, 284, &mut planar);
+        }
+        let mut previous = None;
+        let mut solid = None;
         for y in (top / th..=(bottom - 1) / th).map(|y| y * th) {
             for x in (left / tw..=(right - 1) / tw).map(|x| x * tw) {
-                if unsafe { TIFFReadRGBATileExt(self.0, x, y, tile.as_mut_ptr(), 1) } != 1 {
-                    return Err("cannot decode TIFF tile".into());
+                if cancelled() {
+                    return Err("image loading cancelled".into());
                 }
-                for yy in y.max(top)..y.saturating_add(th).min(bottom) {
-                    for xx in x.max(left)..x.saturating_add(tw).min(right) {
-                        let pixel =
-                            tile[((th - 1 - (yy - y)) as usize * tw as usize) + (xx - x) as usize];
-                        let q = ((yy - top) as usize * (right - left) as usize
-                            + (xx - left) as usize)
-                            * 4;
-                        out.mapping[q..q + 4].copy_from_slice(&pixel.to_le_bytes());
+                let index = (y / th)
+                    .checked_mul(w.div_ceil(tw))
+                    .and_then(|i| i.checked_add(x / tw))
+                    .ok_or("too many TIFF tiles")?;
+                let key = unsafe {
+                    (
+                        TIFFGetStrileOffset(self.0, index),
+                        TIFFGetStrileByteCount(self.0, index),
+                        tw.min(w - x),
+                        th.min(h - y),
+                    )
+                };
+                // Sparse TIFFs may reference the same encoded tile many times.
+                if planar != 1 || previous != Some(key) {
+                    let decoded = unsafe {
+                        if tiled {
+                            TIFFReadRGBATileExt(self.0, x, y, data.as_mut_ptr(), 1)
+                        } else {
+                            TIFFReadRGBAStripExt(self.0, y, data.as_mut_ptr(), 1)
+                        }
+                    };
+                    if decoded != 1 {
+                        return Err("cannot decode TIFF chunk".into());
                     }
+                    let len = if tiled {
+                        data.len()
+                    } else {
+                        tw as usize * th.min(h - y) as usize
+                    };
+                    solid = data[..len]
+                        .iter()
+                        .all(|p| *p == data[0])
+                        .then(|| data[0].to_le_bytes());
+                    previous = Some(key);
                 }
+                visit(Chunk {
+                    x,
+                    y,
+                    width: tw,
+                    height: if tiled { th } else { th.min(h - y) },
+                    solid,
+                    data: &data,
+                })?;
             }
         }
-        Ok(out)
+        Ok(())
     }
 }
 #[link(name = "tiff", kind = "static")]
 unsafe extern "C" {
+    fn TIFFReadScanline(
+        handle: *mut nix::libc::c_void,
+        data: *mut nix::libc::c_void,
+        row: u32,
+        sample: u16,
+    ) -> i32;
+    fn TIFFReadRGBAStripExt(
+        handle: *mut nix::libc::c_void,
+        row: u32,
+        data: *mut u32,
+        stop: i32,
+    ) -> i32;
+    fn TIFFGetStrileOffset(handle: *mut nix::libc::c_void, index: u32) -> u64;
+    fn TIFFGetStrileByteCount(handle: *mut nix::libc::c_void, index: u32) -> u64;
     fn TIFFCurrentDirOffset(handle: *mut nix::libc::c_void) -> u64;
     fn TIFFSetSubDirectory(handle: *mut nix::libc::c_void, offset: u64) -> i32;
     fn TIFFReadDirectory(handle: *mut nix::libc::c_void) -> i32;

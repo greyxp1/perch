@@ -3,6 +3,7 @@ mod document;
 mod image;
 mod ipc;
 mod loader;
+mod overview;
 
 use std::{ffi::OsString, process::ExitCode};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;

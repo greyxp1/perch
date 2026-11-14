@@ -130,7 +130,7 @@ impl Worker {
                         {
                             Ok(cache.take().unwrap().2)
                         } else {
-                            Source::load(input, swap, usize::MAX)
+                            Source::load(input, swap, usize::MAX, &|| !job.live())
                         }
                     };
                     let result = (|| -> crate::Result<Option<Output>> {
@@ -170,7 +170,10 @@ impl Worker {
                                 {
                                     return Ok(None);
                                 }
-                                let source = Source::load(input.clone(), swap, CACHE_BYTES)?;
+                                let source =
+                                    Source::load(input.clone(), swap, CACHE_BYTES, &|| {
+                                        !job.live()
+                                    })?;
                                 if job.live()
                                     && source.bytes() <= CACHE_BYTES
                                     && let Some(path) = source.path()
@@ -199,7 +202,7 @@ impl Worker {
                                     .get(&job.id)
                                     .filter(|a| Arc::ptr_eq(&a.source, source))
                                     .and_then(|a| a.current.as_ref());
-                                let frame = source.render(*view, current, swap)?;
+                                let frame = source.render(*view, current, swap, &|| !job.live())?;
                                 Ok(Some(Output::Rendered {
                                     frame,
                                     delay,
