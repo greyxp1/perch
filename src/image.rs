@@ -828,7 +828,7 @@ impl Tiff {
         unsafe { TIFFIsTiled(self.0) != 0 }
     }
     pub fn readable(&self) -> bool {
-        let mut message = [0_i8; 1024];
+        let mut message = [0 as std::ffi::c_char; 1024];
         let mut compression = 1_u16;
         unsafe {
             TIFFGetField(self.0, 259, &mut compression);
