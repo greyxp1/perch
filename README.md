@@ -66,12 +66,22 @@ Add Perch to your flake inputs:
 inputs.perch.url = "github:greyxp1/perch";
 ```
 
-Import and enable the module in your NixOS or Home Manager configuration:
+Import and enable the module in your NixOS configuration:
 
 ```nix
 {inputs, ...}: {
-  # Use homeModules.default for Home Manager.
   imports = [inputs.perch.nixosModules.default];
+
+  # Optionally add cache settings for pre-built binaries.
+  nix.settings = {
+    extra-substituters = ["https://greyxp1.cachix.org"];
+    extra-trusted-public-keys = ["greyxp1.cachix.org-1:hUnQC8sjfKykPgkFdcXiuv4xjiISuWnBnPfW2F2df3k="];
+  };
+
   programs.perch.enable = true;
 }
 ```
+
+For Home Manager, import `inputs.perch.homeModules.default` and set
+`programs.perch.enable = true`. Add the optional cache settings to your system's
+Nix configuration.
