@@ -1,0 +1,60 @@
+name: Nix cache
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/cache.yml
+      - flake.nix
+      - flake.lock
+      - nix/package.nix
+      - Cargo.toml
+      - Cargo.lock
+      - LICENSE
+      - build.rs
+      - src/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    name: Cache ${{ matrix.system }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-24.04
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Check cache configuration
+        env:
+          CACHIX_CACHE_NAME: ${{ vars.CACHIX_CACHE_NAME }}
+          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        run: |
+          : "${CACHIX_CACHE_NAME:?Set the CACHIX_CACHE_NAME repository variable}"
+          : "${CACHIX_AUTH_TOKEN:?Set the CACHIX_AUTH_TOKEN repository secret}"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+        with:
+          name: ${{ vars.CACHIX_CACHE_NAME }}
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          skipPush: true
+      - name: Build Perch
+        run: nix build --print-build-logs --no-update-lock-file --max-jobs 2 --cores 2 .#packages.${{ matrix.system }}.perch
+      - name: Upload Perch
+        env:
+          CACHIX_CACHE_NAME: ${{ vars.CACHIX_CACHE_NAME }}
+        run: cachix push "$CACHIX_CACHE_NAME" ./result

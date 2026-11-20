@@ -76,6 +76,7 @@ jobs:
     if: needs.prepare.outputs.changed == 'true'
     runs-on: ubuntu-24.04
     permissions:
+      actions: write
       contents: write
     steps:
       - uses: actions/checkout@v6
@@ -96,3 +97,10 @@ jobs:
           git add flake.lock
           git commit -m "updated nix inputs"
           git push origin "HEAD:$UPDATE_BRANCH"
+
+      # Pushes with GITHUB_TOKEN do not trigger other workflows.
+      - name: Cache inputs
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run cache.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"
