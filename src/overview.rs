@@ -114,61 +114,65 @@ impl Overview {
         let first: [u8; 4] = pixels[..4].try_into().unwrap();
         if pixels.as_chunks::<4>().0.iter().all(|p| p == &first) {
             self.solid((x, y, x + pixels.len() as u32 / 4, y + 1), first);
+            Ok(())
         } else {
-            let pixels = pixels.as_chunks::<4>().0;
-            let (left, top, right, bottom) = self.rect;
-            let (l, r) = (
-                x.max(left),
-                x.saturating_add(pixels.len() as u32).min(right),
-            );
-            if l >= r {
-                return Ok(());
-            }
-            let (sw, sh) = (u64::from(right - left), u64::from(bottom - top));
-            let (w, h) = (u64::from(self.size.0), u64::from(self.size.1));
-            let (x0, x1, y0, y1) = (
-                u64::from(l - left) * w,
-                u64::from(r - left) * w,
-                u64::from(y - top) * h,
-                u64::from(y - top + 1) * h,
-            );
-            let norm = 1.0 / sw as f64;
-            self.line.clear();
-            self.line
-                .try_reserve(((x1 - 1) / sw - x0 / sw + 1) as usize)?;
-            for xx in x0 / sw..=(x1 - 1) / sw {
-                let (a, b) = (x0.max(xx * sw), x1.min((xx + 1) * sw));
-                let (first, last) = (a / w, (b - 1) / w);
-                let i = (first + u64::from(left) - u64::from(x)) as usize;
-                let j = (last + u64::from(left) - u64::from(x)) as usize;
-                let mut sum = [0_u64; 4];
-                if i < j {
-                    for pixel in &pixels[i + 1..j] {
-                        for c in 0..4 {
-                            sum[c] += u64::from(pixel[c]);
-                        }
-                    }
-                }
-                let mut color = [0.0; 4];
-                for c in 0..4 {
-                    let value = if i == j {
-                        u64::from(pixels[i][c]) * (b - a)
-                    } else {
-                        u64::from(pixels[i][c]) * ((first + 1) * w - a)
-                            + u64::from(pixels[j][c]) * (b - last * w)
-                            + sum[c] * w
-                    };
-                    color[c] = value as f64 * norm;
-                }
-                self.line.push(color);
-            }
-            for yy in y0 / sh..=(y1 - 1) / sh {
-                let weight = (y1.min((yy + 1) * sh) - y0.max(yy * sh)) as f64 / sh as f64;
-                let row = self.sums.row(yy as usize, w as usize);
-                for (dst, color) in row[(x0 / sw) as usize..].iter_mut().zip(&self.line) {
+            self.mixed(x, y, pixels.as_chunks().0)
+        }
+    }
+    /// Accumulates a row within the overview rows without checking whether it is uniform.
+    pub fn mixed(&mut self, x: u32, y: u32, pixels: &[[u8; 4]]) -> Result<()> {
+        let (left, top, right, bottom) = self.rect;
+        let (l, r) = (
+            x.max(left),
+            x.saturating_add(pixels.len() as u32).min(right),
+        );
+        if l >= r {
+            return Ok(());
+        }
+        let (sw, sh) = (u64::from(right - left), u64::from(bottom - top));
+        let (w, h) = (u64::from(self.size.0), u64::from(self.size.1));
+        let (x0, x1, y0, y1) = (
+            u64::from(l - left) * w,
+            u64::from(r - left) * w,
+            u64::from(y - top) * h,
+            u64::from(y - top + 1) * h,
+        );
+        let norm = 1.0 / sw as f64;
+        self.line.clear();
+        self.line
+            .try_reserve(((x1 - 1) / sw - x0 / sw + 1) as usize)?;
+        for xx in x0 / sw..=(x1 - 1) / sw {
+            let (a, b) = (x0.max(xx * sw), x1.min((xx + 1) * sw));
+            let (first, last) = (a / w, (b - 1) / w);
+            let i = (first + u64::from(left) - u64::from(x)) as usize;
+            let j = (last + u64::from(left) - u64::from(x)) as usize;
+            let mut sum = [0_u64; 4];
+            if i < j {
+                for pixel in &pixels[i + 1..j] {
                     for c in 0..4 {
-                        dst[c] += color[c] * weight;
+                        sum[c] += u64::from(pixel[c]);
                     }
+                }
+            }
+            let mut color = [0.0; 4];
+            for c in 0..4 {
+                let value = if i == j {
+                    u64::from(pixels[i][c]) * (b - a)
+                } else {
+                    u64::from(pixels[i][c]) * ((first + 1) * w - a)
+                        + u64::from(pixels[j][c]) * (b - last * w)
+                        + sum[c] * w
+                };
+                color[c] = value as f64 * norm;
+            }
+            self.line.push(color);
+        }
+        for yy in y0 / sh..=(y1 - 1) / sh {
+            let weight = (y1.min((yy + 1) * sh) - y0.max(yy * sh)) as f64 / sh as f64;
+            let row = self.sums.row(yy as usize, w as usize);
+            for (dst, color) in row[(x0 / sw) as usize..].iter_mut().zip(&self.line) {
+                for c in 0..4 {
+                    dst[c] += color[c] * weight;
                 }
             }
         }

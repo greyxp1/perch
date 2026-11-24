@@ -22,7 +22,6 @@ use std::{
 
 type Rect = (u32, u32, u32, u32);
 
-pub const CACHE_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Clone)]
 pub enum Input {
     Path(PathBuf),
@@ -85,8 +84,9 @@ struct Level {
     offset: u64,
     width: u32,
     height: u32,
+    chunk_bytes: usize,
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct View {
     pub width: u32,
     pub height: u32,
@@ -164,6 +164,7 @@ impl Source {
                         offset,
                         width: w,
                         height: h,
+                        chunk_bytes: native.chunk_bytes(w, h),
                     });
                 }
                 let children = native.children();
@@ -263,6 +264,46 @@ impl Source {
             }
         }
     }
+    /// Whether `frame` is too coarse for `view`, so rendering decodes a region.
+    fn coarse(&self, frame: &Frame, view: View) -> bool {
+        let required = (f64::from(view.width) / view.span_width)
+            .max(f64::from(view.height) / view.span_height)
+            .min(1.0);
+        let scale = (f64::from(frame.width) / f64::from(self.size.0))
+            .min(f64::from(frame.height) / f64::from(self.size.1));
+        scale + 1e-8 < required
+    }
+    /// Bounds the memory rendering `view` of the whole image allocates beyond `bytes`.
+    pub fn fit_bytes(&self, view: View) -> usize {
+        let pixels = |(w, h): (u32, u32)| w as usize * h as usize;
+        // Orienting copies decoded pixels up to three times, and area filtering
+        // accumulates 32 bytes per output pixel besides its result.
+        let decoded = |size: (u32, u32)| {
+            if pixels(size) > crate::RENDER_BYTES / 8 {
+                pixels(crate::overview::fit(size, view.width.max(view.height))) * 36
+            } else {
+                pixels(size) * 16
+            }
+        };
+        let output = (view.width, view.height);
+        (pixels(output) * 4).saturating_add(match &self.data {
+            Data::Tiff { levels, .. } => {
+                let level = (levels.iter())
+                    .rfind(|l| {
+                        let (w, h) = oriented((l.width, l.height), self.orientation);
+                        w >= output.0 && h >= output.1
+                    })
+                    .unwrap_or(&levels[0]);
+                decoded((level.width, level.height))
+                    .saturating_add(level.chunk_bytes.saturating_mul(3))
+            }
+            Data::Raster {
+                frame,
+                format: Some(_),
+            } if self.coarse(frame, view) => decoded(self.size),
+            Data::Raster { .. } => 0,
+        })
+    }
     pub fn render(
         &self,
         view: View,
@@ -295,12 +336,8 @@ impl Source {
                 self.region(levels, overview, rect, (w, h), swap, cancelled)?
             }
             Data::Raster { frame, format } => {
-                let required = (f64::from(view.width) / view.span_width)
-                    .max(f64::from(view.height) / view.span_height)
-                    .min(1.0);
-                let scale = (f64::from(frame.width) / sw).min(f64::from(frame.height) / sh);
                 if animation.is_none()
-                    && scale + 1e-8 < required
+                    && self.coarse(frame, view)
                     && let Some(format) = format
                 {
                     self.raster_region(rect, (w, h), swap, cancelled, *format)?

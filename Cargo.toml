@@ -21,6 +21,7 @@ xkbcommon = "0.9"
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client"] }
 png = "0.18.1"
+bytemuck = "1.25.2"
 
 [build-dependencies]
 bindgen = { version = "0.72.1", default-features = false, features = ["runtime"] }

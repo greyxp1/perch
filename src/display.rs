@@ -133,9 +133,8 @@ impl Pin {
     fn fit(&self) -> f64 {
         self.fit_in(self.bounds, 0.9).min(1.0)
     }
-    fn fit_in(&self, (w, h): (i32, i32), margin: f64) -> f64 {
-        (f64::from(w) * margin / f64::from(self.source.size.0))
-            .min(f64::from(h) * margin / f64::from(self.source.size.1))
+    fn fit_in(&self, area: (i32, i32), margin: f64) -> f64 {
+        fit_in(self.source.size, area, margin)
     }
     fn center_image(&mut self) {
         self.center = (
@@ -144,10 +143,7 @@ impl Pin {
         );
     }
     fn size_to_zoom(&mut self) {
-        self.size = (
-            (f64::from(self.source.size.0) * self.zoom).round().max(1.0) as i32,
-            (f64::from(self.source.size.1) * self.zoom).round().max(1.0) as i32,
-        );
+        self.size = scaled(self.source.size, self.zoom);
     }
     fn initial_size(&mut self) {
         self.zoom = self.fit();
@@ -175,46 +171,8 @@ impl Pin {
         };
     }
     fn view(&self) -> View {
-        let (mut width, mut height) = (
-            f64::from(self.size.0) * f64::from(self.scale),
-            f64::from(self.size.1) * f64::from(self.scale),
-        );
-        if !self.inspect {
-            let ratio = (f64::from(self.source.size.0) / width)
-                .min(f64::from(self.source.size.1) / height)
-                .min(1.0);
-            width *= ratio;
-            height *= ratio;
-        }
-        let pixels = crate::RENDER_BYTES / 4;
-        let ratio = (pixels as f64 / (width * height)).sqrt().min(1.0);
-        width = (width * ratio).round().clamp(1.0, pixels as f64);
-        height = (height * ratio)
-            .round()
-            .clamp(1.0, (pixels / width as usize) as f64);
-        let (left, top, span_width, span_height) = if self.inspect {
-            (
-                self.center.0 - f64::from(self.size.0) / self.zoom / 2.0,
-                self.center.1 - f64::from(self.size.1) / self.zoom / 2.0,
-                f64::from(self.size.0) / self.zoom,
-                f64::from(self.size.1) / self.zoom,
-            )
-        } else {
-            (
-                0.0,
-                0.0,
-                f64::from(self.source.size.0),
-                f64::from(self.source.size.1),
-            )
-        };
-        View {
-            width: width as u32,
-            height: height as u32,
-            left,
-            top,
-            span_width,
-            span_height,
-        }
+        let inspect = self.inspect.then_some((self.zoom, self.center));
+        view(self.source.size, self.size, self.scale, inspect)
     }
     fn zoom(&mut self, value: f64) {
         let (minimum, maximum) = if self.inspect {
@@ -256,6 +214,61 @@ impl Drop for Pin {
         if let Some(buffer) = self.buffer.take() {
             buffer.destroy();
         }
+    }
+}
+fn fit_in(source: (u32, u32), (w, h): (i32, i32), margin: f64) -> f64 {
+    (f64::from(w) * margin / f64::from(source.0)).min(f64::from(h) * margin / f64::from(source.1))
+}
+fn scaled(source: (u32, u32), zoom: f64) -> (i32, i32) {
+    (
+        (f64::from(source.0) * zoom).round().max(1.0) as i32,
+        (f64::from(source.1) * zoom).round().max(1.0) as i32,
+    )
+}
+/// The view a newly loaded image opens with.
+pub fn fit_view(source: (u32, u32), bounds: (i32, i32), scale: i32) -> View {
+    let size = scaled(source, fit_in(source, bounds, 0.9).min(1.0));
+    view(source, size, scale, None)
+}
+fn view(
+    source: (u32, u32),
+    size: (i32, i32),
+    scale: i32,
+    inspect: Option<(f64, (f64, f64))>,
+) -> View {
+    let (mut width, mut height) = (
+        f64::from(size.0) * f64::from(scale),
+        f64::from(size.1) * f64::from(scale),
+    );
+    if inspect.is_none() {
+        let ratio = (f64::from(source.0) / width)
+            .min(f64::from(source.1) / height)
+            .min(1.0);
+        width *= ratio;
+        height *= ratio;
+    }
+    let pixels = crate::RENDER_BYTES / 4;
+    let ratio = (pixels as f64 / (width * height)).sqrt().min(1.0);
+    width = (width * ratio).round().clamp(1.0, pixels as f64);
+    height = (height * ratio)
+        .round()
+        .clamp(1.0, (pixels / width as usize) as f64);
+    let (left, top, span_width, span_height) = match inspect {
+        Some((zoom, center)) => (
+            center.0 - f64::from(size.0) / zoom / 2.0,
+            center.1 - f64::from(size.1) / zoom / 2.0,
+            f64::from(size.0) / zoom,
+            f64::from(size.1) / zoom,
+        ),
+        None => (0.0, 0.0, f64::from(source.0), f64::from(source.1)),
+    };
+    View {
+        width: width as u32,
+        height: height as u32,
+        left,
+        top,
+        span_width,
+        span_height,
     }
 }
 enum PendingState {
@@ -399,18 +412,12 @@ impl App {
         let Some(pin) = self.pins.get(&id) else {
             return;
         };
-        if pin.paths.len() < 2 {
-            return;
-        }
-        let input = Input::Path(pin.paths[pin.neighbor(pin.direction)].clone());
-        if let Some(worker) = &self.worker {
-            worker.submit(Job {
-                id,
-                generation: pin.generation(),
-                token: pin.token.clone(),
-                action: Action::Preload(input),
-            });
-        }
+        // Up to three distinct neighbors in the navigation direction, nearest first.
+        let paths = (1..pin.paths.len().min(4))
+            .map(|step| pin.paths[pin.neighbor(pin.direction * step as isize)].clone())
+            .collect();
+        let screen = (pin.bounds, pin.scale);
+        (self.worker.as_ref().unwrap()).ahead(id, &pin.token, paths, screen);
     }
     fn navigate(&mut self, id: u64, direction: isize) {
         let Some(pin) = self.pins.get_mut(&id) else {
@@ -419,8 +426,8 @@ impl App {
         if pin.paths.len() < 2 || pin.request.is_some() {
             return;
         }
-        // An idle pin can only have a speculative decode outstanding. Keep it
-        // alive if this load will use its result.
+        // An idle pin can only have speculative work outstanding. Keep it alive
+        // if this load or the following ones will use its results.
         if pin.work != Work::Idle || pin.direction != direction {
             loader::cancel(&pin.token);
         }
@@ -441,6 +448,7 @@ impl App {
             pin.work = Work::Idle;
             pin.index = pin.loaded_index;
             pin.title();
+            self.preload(id);
         }
     }
     fn key(&mut self, id: u64, key: u32) {
@@ -537,61 +545,25 @@ impl App {
             };
             pin.work = Work::Idle;
             match result {
-                Ok(Output::Loaded(source)) => {
+                Ok(Output::Loaded(source, frame)) => {
                     pin.source = source;
                     pin.loaded_index = pin.index;
                     pin.ended = false;
                     pin.initial_size();
                     pin.constraints();
-                    pin.work = Work::Render;
                     pin.title();
+                    match frame {
+                        Some((view, frame)) if view == pin.view() => {
+                            self.present(id, frame, None, false, qh)
+                        }
+                        _ => pin.work = Work::Render,
+                    }
                 }
                 Ok(Output::Rendered {
                     frame,
                     delay,
                     stepped,
-                }) => {
-                    let buffer = frame.buffer(self.shm.as_ref().unwrap(), self.abgr, qh);
-                    let old = pin.buffer.replace(buffer.clone());
-                    let first = old.inspect(wl_buffer::WlBuffer::destroy).is_none();
-                    pin.viewport.set_destination(pin.size.0, pin.size.1);
-                    pin.surface.attach(Some(&buffer), 0, 0);
-                    pin.surface.damage_buffer(0, 0, frame.width, frame.height);
-                    if stepped {
-                        pin.ended = delay.is_none();
-                        if let Some(delay) = delay {
-                            pin.next_frame = Instant::now() + delay;
-                        } else {
-                            pin.playing = false;
-                            pin.title();
-                        }
-                    }
-                    if pin.playing && pin.callback.is_none() {
-                        pin.arm_callback(id, qh);
-                    }
-                    pin.surface.commit();
-                    if first
-                        && let Some(request) = pin.request
-                        && let Some(Pending {
-                            state: PendingState::Rendering(_, remaining),
-                            ..
-                        }) = self.pending.get_mut(&request)
-                    {
-                        *remaining -= 1;
-                        if *remaining == 0 {
-                            let pending = self.pending.remove(&request).unwrap();
-                            if let PendingState::Rendering(ids, _) = &pending.state {
-                                for id in ids {
-                                    if let Some(pin) = self.pins.get_mut(id) {
-                                        pin.request = None;
-                                    }
-                                }
-                            }
-                            let _ = ipc::reply(&pending.fd, true);
-                        }
-                    }
-                    self.preload(id);
-                }
+                }) => self.present(id, frame, delay, stepped, qh),
                 Err(error) => {
                     eprintln!("perch: {error}");
                     pin.index = pin.loaded_index;
@@ -600,10 +572,62 @@ impl App {
                     if let Some(request) = pin.request {
                         self.fail_request(request);
                     }
+                    // Replanning evicts entries kept for a direction the failed load reversed.
+                    self.preload(id);
                 }
                 _ => {}
             }
         }
+    }
+    fn present(
+        &mut self,
+        id: u64,
+        frame: Arc<Frame>,
+        delay: Option<Duration>,
+        stepped: bool,
+        qh: &QueueHandle<Self>,
+    ) {
+        let pin = self.pins.get_mut(&id).unwrap();
+        let buffer = frame.buffer(self.shm.as_ref().unwrap(), self.abgr, qh);
+        let old = pin.buffer.replace(buffer.clone());
+        let first = old.inspect(wl_buffer::WlBuffer::destroy).is_none();
+        pin.viewport.set_destination(pin.size.0, pin.size.1);
+        pin.surface.attach(Some(&buffer), 0, 0);
+        pin.surface.damage_buffer(0, 0, frame.width, frame.height);
+        if stepped {
+            pin.ended = delay.is_none();
+            if let Some(delay) = delay {
+                pin.next_frame = Instant::now() + delay;
+            } else {
+                pin.playing = false;
+                pin.title();
+            }
+        }
+        if pin.playing && pin.callback.is_none() {
+            pin.arm_callback(id, qh);
+        }
+        pin.surface.commit();
+        if first
+            && let Some(request) = pin.request
+            && let Some(Pending {
+                state: PendingState::Rendering(_, remaining),
+                ..
+            }) = self.pending.get_mut(&request)
+        {
+            *remaining -= 1;
+            if *remaining == 0 {
+                let pending = self.pending.remove(&request).unwrap();
+                if let PendingState::Rendering(ids, _) = &pending.state {
+                    for id in ids {
+                        if let Some(pin) = self.pins.get_mut(id) {
+                            pin.request = None;
+                        }
+                    }
+                }
+                let _ = ipc::reply(&pending.fd, true);
+            }
+        }
+        self.preload(id);
     }
     fn schedule(&mut self, qh: &QueueHandle<Self>) -> Option<Duration> {
         let now = Instant::now();

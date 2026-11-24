@@ -783,12 +783,17 @@ struct Chunk<'a> {
     pub width: u32,
     pub height: u32,
     pub solid: Option<[u8; 4]>,
-    data: &'a [u32],
+    data: &'a [u8],
 }
 impl Chunk<'_> {
-    pub fn row(&self, y: u32) -> &[u32] {
-        let offset = (self.height - 1 - (y - self.y)) as usize * self.width as usize;
-        &self.data[offset..offset + self.width as usize]
+    /// Yields the chunk rows within `top..bottom`.
+    fn rows(&self, top: u32, bottom: u32) -> impl Iterator<Item = (u32, &[u8])> {
+        let stride = self.width as usize * 4;
+        let end = self.y.saturating_add(self.height).min(bottom);
+        (self.y.max(top)..end).map(move |y| {
+            let offset = (self.height - 1 - (y - self.y)) as usize * stride;
+            (y, &self.data[offset..offset + stride])
+        })
     }
 }
 pub struct Tiff(*mut TIFF);
@@ -837,6 +842,28 @@ impl Tiff {
             Ok((w, h))
         } else {
             Err("invalid TIFF dimensions".into())
+        }
+    }
+    pub fn chunk_bytes(&self, width: u32, height: u32) -> usize {
+        let (mut tw, mut th) = (width, height);
+        let tiled = self.tiled();
+        if tiled {
+            if unsafe {
+                TIFFGetField(self.0, 322, &mut tw) != 1 || TIFFGetField(self.0, 323, &mut th) != 1
+            } {
+                return usize::MAX;
+            }
+        } else {
+            unsafe {
+                TIFFGetField(self.0, 278, &mut th);
+            }
+            th = th.min(height);
+        }
+        let bytes = (tw as usize).saturating_mul(th as usize).saturating_mul(4);
+        if !tiled && bytes > crate::RENDER_BYTES / 2 {
+            (width as usize).saturating_mul(4)
+        } else {
+            bytes
         }
     }
     pub fn orientation(&self) -> u16 {
@@ -896,19 +923,13 @@ impl Tiff {
         let (left, top, right, bottom) = rect;
         let mut out = Pixels::new((right - left).try_into()?, (bottom - top).try_into()?)?;
         self.visit(rect, cancelled, |tile| {
-            for y in tile.y.max(top)..tile.y.saturating_add(tile.height).min(bottom) {
-                let start = tile.x.max(left);
-                let end = tile.x.saturating_add(tile.width).min(right);
-                let row = &tile.row(y)[(start - tile.x) as usize..(end - tile.x) as usize];
+            let start = tile.x.max(left);
+            let end = tile.x.saturating_add(tile.width).min(right);
+            for (y, row) in tile.rows(top, bottom) {
+                let row = &row[(start - tile.x) as usize * 4..(end - tile.x) as usize * 4];
                 let offset =
                     ((y - top) as usize * (right - left) as usize + (start - left) as usize) * 4;
-                for (src, dst) in row.iter().zip(
-                    out.mapping[offset..offset + row.len() * 4]
-                        .as_chunks_mut::<4>()
-                        .0,
-                ) {
-                    dst.copy_from_slice(&src.to_le_bytes());
-                }
+                out.mapping[offset..offset + row.len()].copy_from_slice(row);
             }
             Ok(())
         })?;
@@ -922,7 +943,6 @@ impl Tiff {
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Pixels> {
         let mut overview = crate::overview::Overview::new(rect, size, !self.tiled())?;
-        let mut row = Vec::new();
         self.visit(rect, cancelled, |tile| {
             if let Some(pixel) = tile.solid {
                 overview.solid(
@@ -935,12 +955,13 @@ impl Tiff {
                     pixel,
                 );
             } else {
-                row.resize(tile.width as usize * 4, 0);
-                for y in tile.y.max(rect.1)..tile.y.saturating_add(tile.height).min(rect.3) {
-                    for (src, dst) in tile.row(y).iter().zip(row.as_chunks_mut::<4>().0) {
-                        dst.copy_from_slice(&src.to_le_bytes());
+                for (y, row) in tile.rows(rect.1, rect.3) {
+                    // A mixed single-row chunk is a mixed row.
+                    if tile.height == 1 {
+                        overview.mixed(tile.x, y, row.as_chunks().0)?;
+                    } else {
+                        overview.row(tile.x, y, row)?;
                     }
-                    overview.row(tile.x, y, &row)?;
                 }
             }
             Ok(())
@@ -998,7 +1019,7 @@ impl Tiff {
         row.resize(len, 0_u8);
         let mut rgba = Vec::new();
         rgba.try_reserve_exact(width as usize)?;
-        rgba.resize(width as usize, 0_u32);
+        rgba.resize(width as usize, [0_u8; 4]);
         for y in rect.1 / rows * rows..rect.3 {
             if cancelled() {
                 return Err("image loading cancelled".into());
@@ -1037,26 +1058,22 @@ impl Tiff {
                 } else {
                     sample(colors as usize)
                 };
-                let mut pixel = [r, g, b, a];
+                *dst = [r, g, b, a];
                 if alpha == 2 {
-                    for channel in &mut pixel[..3] {
+                    for channel in &mut dst[..3] {
                         let n = u16::from(*channel) * u16::from(a) + 128;
                         *channel = ((n + (n >> 8)) >> 8) as u8;
                     }
                 }
-                *dst = u32::from_le_bytes(pixel);
             }
-            let solid = rgba
-                .iter()
-                .all(|p| *p == rgba[0])
-                .then(|| rgba[0].to_le_bytes());
+            let solid = rgba.iter().all(|p| *p == rgba[0]).then_some(rgba[0]);
             visit(Chunk {
                 x: 0,
                 y,
                 width,
                 height: 1,
                 solid,
-                data: &rgba,
+                data: rgba.as_flattened(),
             })?;
         }
         Ok(true)
@@ -1144,10 +1161,14 @@ impl Tiff {
                     } else {
                         tw as usize * th.min(h - y) as usize
                     };
-                    solid = data[..len]
-                        .iter()
+                    // libtiff packs RGBA into native words, so chunks borrow little-endian bytes.
+                    #[cfg(target_endian = "big")]
+                    for p in &mut data[..len] {
+                        *p = p.to_le();
+                    }
+                    solid = (data[..len].iter())
                         .all(|p| *p == data[0])
-                        .then(|| data[0].to_le_bytes());
+                        .then(|| data[0].to_ne_bytes());
                     previous = Some(key);
                 }
                 visit(Chunk {
@@ -1156,7 +1177,7 @@ impl Tiff {
                     width: tw,
                     height: if tiled { th } else { th.min(h - y) },
                     solid,
-                    data: &data,
+                    data: bytemuck::cast_slice(&data),
                 })?;
             }
         }
