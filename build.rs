@@ -1,7 +1,10 @@
 use std::{env, path::PathBuf};
 
 fn main() {
+    // Libjxl comes first so its CMS archive precedes LCMS2 on the link line.
     let libraries = [
+        "libjxl",
+        "libjxl_threads",
         "libheif",
         "libraw",
         "MagickWand",
@@ -12,7 +15,7 @@ fn main() {
     let mut bindings = bindgen::Builder::default()
         .header_contents(
             "perch-codecs.h",
-            "#include <libraw/libraw.h>\n#include <MagickWand/MagickWand.h>\n#include <lcms2.h>\n#include <webp/decode.h>\n#include <webp/encode.h>\n#include <webp/mux.h>\n#include <tiffio.h>\n#include <stdio.h>\n#include <jpeglib.h>\nenum PerchCmsFormat { RGBA8 = TYPE_RGBA_8, GRAY8 = TYPE_GRAY_8, CMYK8 = TYPE_CMYK_8 };",
+            "#include <libraw/libraw.h>\n#include <MagickWand/MagickWand.h>\n#include <lcms2.h>\n#include <webp/decode.h>\n#include <webp/encode.h>\n#include <webp/mux.h>\n#include <tiffio.h>\n#include <stdio.h>\n#include <jpeglib.h>\n#include <jxl/encode.h>\n#include <jxl/thread_parallel_runner.h>\nenum PerchCmsFormat { RGBA8 = TYPE_RGBA_8, GRAY8 = TYPE_GRAY_8, CMYK8 = TYPE_CMYK_8 };",
         )
         .allowlist_function("libraw_(init|open_file|close|unpack|set_progress_handler|dcraw_(process|make_mem_image|clear_mem))")
         .allowlist_function("(New|Destroy)MagickWand|Magick(WandGenesis|SetProgressMonitor|ReadImage|SetFirstIterator|GetImage(Width|Height|Profile)|RelinquishMemory|ProfileImage|TransformImageColorspace|ExportImagePixels)")
@@ -26,6 +29,8 @@ fn main() {
         .allowlist_function("WebP(ConfigInitInternal|ConfigLosslessPreset|ValidateConfig|PictureInitInternal|PictureImportRGBA|PictureFree|Encode|MemoryWrite(rInit|rClear)?)")
         .allowlist_function("WebPMux(CreateInternal|(Get|Set|Delete)Chunk|Assemble|Delete)")
         .allowlist_var("WEBP_(DECODER|ENCODER|MUX)_ABI_VERSION")
+        .allowlist_function("Jxl(ColorEncodingSetToSRGB|ThreadParallelRunner(Create|Destroy|DefaultNumWorkerThreads)?)")
+        .allowlist_function("JxlEncoder(Create|Destroy|GetError|SetParallelRunner|InitBasicInfo|SetBasicInfo|SetColorEncoding|SetICCProfile|UseBoxes|AddBox|CloseBoxes|FrameSettingsCreate|SetFrameLossless|SetFrameDistance|DistanceFromQuality|AddImageFrame|CloseInput|ProcessOutput)")
         .layout_tests(false);
     for library in libraries {
         let mut config = pkg_config::Config::new();

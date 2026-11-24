@@ -15,17 +15,17 @@ use std::{
 const CONVERT_HELP: &str = "\
 Usage: perch convert IMAGE... --to FORMAT [OPTIONS]
 
-Converts images to PNG, JPEG, WebP, TIFF, BMP, GIF, ICO or QOI, taking the
-first frame of animations. Each result is written next to its source with the
-new extension, and a source that already has it gains a -converted suffix. EXIF
-orientation is applied to the pixels. Color profiles are kept, except in BMP,
-GIF and QOI, which are converted to sRGB and hold no metadata. TIFF metadata is
-limited to XMP.
+Converts images to PNG, JPEG, WebP, AVIF, JXL, TIFF, BMP, GIF, ICO or QOI,
+taking the first frame of animations. Each result is written next to its source
+with the new extension, and a source that already has it gains a -converted
+suffix. EXIF orientation is applied to the pixels. Color profiles are kept,
+except in BMP, GIF and QOI, which are converted to sRGB and hold no metadata.
+Lossy XYB JXL sources are converted to sRGB. TIFF metadata is limited to XMP.
 
 Options:
   --to FORMAT       Output format
-  --quality N       JPEG and WebP quality from 1 to 100 (default 85)
-  --lossless        Encode WebP losslessly
+  --quality N       JPEG, WebP, AVIF and JXL quality from 1 to 100 (default 85)
+  --lossless        Encode WebP, AVIF and JXL losslessly
   --resize SIZE     Scale to fit WxH, to a width Wx or height xH, or by N%
   --bg COLOR        Background for JPEG and BMP transparency (default #ffffff)
   --keep-metadata   Keep EXIF and XMP metadata
@@ -37,13 +37,16 @@ Options:
 const COMPRESS_HELP: &str = "\
 Usage: perch compress IMAGE... [OPTIONS]
 
-Shrinks PNG, JPEG, WebP and TIFF images. Compression is lossless unless --lossy
-is given, and EXIF and XMP metadata are removed while color profiles and
-orientation stay. Each result is written next to its source with a -min suffix,
-and nothing is written when the result is not smaller.
+Shrinks PNG, JPEG, WebP, TIFF, AVIF and JXL images. Compression is lossless
+unless --lossy is given, and EXIF and XMP metadata are removed while color
+profiles and orientation stay, except that lossy XYB JXL is converted to sRGB.
+Lossy AVIF and JXL images need --lossy, and animated ones, those above 8 bits
+per channel and JXL with channels beyond RGB or grayscale and one alpha are
+refused. Each result is written next to its source with a -min suffix, and
+nothing is written when the result is not smaller.
 
 Options:
-  --lossy           Re-encode still PNG, JPEG and WebP with visible quality loss
+  --lossy           Re-encode PNG, JPEG, WebP, AVIF and JXL stills lossily
   --quality N       Lossy quality from 1 to 100 (default 85)
   --keep-metadata   Keep EXIF and XMP metadata, of which TIFF keeps only XMP
   --out PATH        Output directory, or output file for one image

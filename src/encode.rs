@@ -1,4 +1,4 @@
-use crate::{Result, shm::Pixels};
+use crate::{Result, decode::Kind, shm::Pixels};
 use fast_image_resize::{
     MulDiv,
     PixelType::U8x4,
@@ -9,8 +9,10 @@ use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, metadata::Orie
 use moxcms::{ColorProfile, DataColorSpace, Layout, TransformOptions};
 use std::{io::Cursor, path::Path};
 
+mod avif;
 pub mod cli;
 mod jpeg;
+mod jxl;
 mod png;
 mod raster;
 mod webp;
@@ -25,6 +27,8 @@ pub enum Format {
     Gif,
     Ico,
     Qoi,
+    Avif,
+    Jxl,
 }
 impl Format {
     pub fn parse(name: &str) -> Option<Self> {
@@ -37,10 +41,17 @@ impl Format {
             "gif" => Self::Gif,
             "ico" => Self::Ico,
             "qoi" => Self::Qoi,
+            "avif" => Self::Avif,
+            "jxl" => Self::Jxl,
             _ => return None,
         })
     }
     pub fn detect(bytes: &[u8]) -> Option<Self> {
+        match crate::decode::kind(&mut Cursor::new(bytes)).ok()? {
+            Some(Kind::Avif) => return Some(Self::Avif),
+            Some(Kind::Jxl) => return Some(Self::Jxl),
+            _ => {}
+        }
         Some(match image::guess_format(bytes).ok()? {
             ImageFormat::Png => Self::Png,
             ImageFormat::Jpeg => Self::Jpeg,
@@ -63,6 +74,8 @@ impl Format {
             Self::Gif => "gif",
             Self::Ico => "ico",
             Self::Qoi => "qoi",
+            Self::Avif => "avif",
+            Self::Jxl => "jxl",
         }
     }
 }
@@ -144,12 +157,12 @@ impl Raster {
     /// Decodes the first frame, using the viewer's decoders for formats the image crate lacks.
     pub fn load(bytes: &[u8], path: Option<&Path>) -> Result<Self> {
         let format = image::guess_format(bytes).ok();
-        if matches!(format, None | Some(ImageFormat::Avif))
-            && let Some(path) = path
-            && let Some(kind) = crate::decode::kind(&mut Cursor::new(bytes))?
-        {
-            let file = std::fs::File::open(path)?;
-            return Self::premultiplied(crate::decode::preview(file, kind, usize::MAX)?.0);
+        if matches!(format, None | Some(ImageFormat::Avif)) {
+            match crate::decode::kind(&mut Cursor::new(bytes))? {
+                Some(Kind::Jxl) => return jxl::load(bytes),
+                Some(Kind::Heif | Kind::Avif) => return avif::load(bytes),
+                None => {}
+            }
         }
         if matches!(format, None | Some(ImageFormat::Tiff))
             && let Some(path) = path
@@ -212,12 +225,7 @@ impl Raster {
                 xmp: None,
             }
         };
-        match space {
-            // Gray profiles cannot describe the RGB samples every encoder receives.
-            Some(DataColorSpace::Gray) => raster.convert_srgb()?,
-            Some(DataColorSpace::Rgb) | None => {}
-            Some(_) => raster.icc = None,
-        }
+        raster.fit_profile()?;
         raster.exif = exif;
         raster.xmp = xmp;
         Ok(raster)
@@ -237,6 +245,22 @@ impl Raster {
             exif: None,
             xmp: None,
         })
+    }
+
+    /// Keeps RGB profiles, converting gray ones to sRGB and dropping others.
+    fn fit_profile(&mut self) -> Result<()> {
+        let space = (self.icc.as_deref())
+            .and_then(|icc| ColorProfile::new_from_slice(icc).ok())
+            .map(|profile| profile.color_space);
+        match space {
+            // Gray profiles cannot describe the RGB samples every encoder receives.
+            Some(DataColorSpace::Gray) => self.convert_srgb(),
+            Some(DataColorSpace::Rgb) | None => Ok(()),
+            Some(_) => {
+                self.icc = None;
+                Ok(())
+            }
+        }
     }
 
     /// Converts the pixels to sRGB and drops the profile.
@@ -327,6 +351,8 @@ impl Raster {
             Format::Gif => raster::gif(self),
             Format::Ico => raster::ico(self),
             Format::Qoi => raster::qoi(self),
+            Format::Avif => avif::encode(self, quality, lossless),
+            Format::Jxl => jxl::encode(self, quality, lossless),
         }
     }
 
@@ -390,11 +416,13 @@ pub fn compress(bytes: &[u8], options: &CompressOptions) -> Result<Option<Vec<u8
         }
         Some(Format::Jpeg) => jpeg::transcode(bytes, keep)?,
         Some(Format::WebP) => webp::compress(bytes, options, decode)?,
+        Some(Format::Avif) => avif::compress(bytes, options)?,
+        Some(Format::Jxl) => jxl::compress(bytes, options)?,
         Some(Format::Tiff) => {
             let alpha = raster::tiff_layout(bytes)?;
             raster::tiff(&decode()?, alpha)?
         }
-        _ => return Err("only PNG, JPEG, WebP and TIFF can be compressed".into()),
+        _ => return Err("only PNG, JPEG, WebP, TIFF, AVIF and JXL can be compressed".into()),
     };
     Ok((output.len() < bytes.len()).then_some(output))
 }

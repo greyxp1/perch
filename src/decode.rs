@@ -11,9 +11,9 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-mod heif_avif;
+pub(crate) mod heif_avif;
 mod jpeg_webp;
-mod jxl;
+pub(crate) mod jxl;
 mod png;
 pub mod psd_raw;
 mod tiff;

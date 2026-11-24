@@ -93,36 +93,7 @@ impl Iterator for JxlFrames {
         Some(
             (|| -> Result<Frame> {
                 let render = self.image.render_frame(index).map_err(error)?;
-                let mut stream = render.stream();
-                let (w, h, channels) =
-                    (stream.width(), stream.height(), stream.channels() as usize);
-                let len = (w as usize)
-                    .checked_mul(h as usize)
-                    .and_then(|n| n.checked_mul(channels))
-                    .ok_or("JPEG XL frame is too large")?;
-                let mut samples = Vec::new();
-                samples.try_reserve_exact(len)?;
-                samples.resize(len, 0u8);
-                if stream.write_to_buffer(&mut samples) != len {
-                    return Err("incomplete JPEG XL frame".into());
-                }
-                let rgba = if channels == 4 {
-                    RgbaImage::from_raw(w, h, samples).ok_or("invalid JPEG XL frame size")?
-                } else {
-                    let mut rgba = RgbaImage::new(w, h);
-                    if channels == 3 {
-                        crate::shm::expand_rgb(&samples, rgba.as_mut());
-                    } else {
-                        for (src, dst) in samples.chunks_exact(channels).zip(rgba.pixels_mut()) {
-                            dst.0 = match channels {
-                                1 => [src[0], src[0], src[0], 255],
-                                2 => [src[0], src[0], src[0], src[1]],
-                                _ => return Err("unsupported JPEG XL channels".into()),
-                            };
-                        }
-                    }
-                    rgba
-                };
+                let rgba = rgba(&render)?;
                 let delay = self
                     .image
                     .image_header()
@@ -145,6 +116,38 @@ impl Iterator for JxlFrames {
             .map_err(error),
         )
     }
+}
+
+/// Expands a rendered frame's gray, RGB or alpha samples to RGBA8.
+pub(crate) fn rgba(render: &jxl_oxide::Render) -> Result<RgbaImage> {
+    let mut stream = render.stream();
+    let (w, h, channels) = (stream.width(), stream.height(), stream.channels() as usize);
+    let len = (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|n| n.checked_mul(channels))
+        .ok_or("JPEG XL frame is too large")?;
+    let mut samples = Vec::new();
+    samples.try_reserve_exact(len)?;
+    samples.resize(len, 0u8);
+    if stream.write_to_buffer(&mut samples) != len {
+        return Err("incomplete JPEG XL frame".into());
+    }
+    if channels == 4 {
+        return Ok(RgbaImage::from_raw(w, h, samples).ok_or("invalid JPEG XL frame size")?);
+    }
+    let mut rgba = RgbaImage::new(w, h);
+    if channels == 3 {
+        crate::shm::expand_rgb(&samples, rgba.as_mut());
+    } else {
+        for (src, dst) in samples.chunks_exact(channels).zip(rgba.pixels_mut()) {
+            dst.0 = match channels {
+                1 => [src[0], src[0], src[0], 255],
+                2 => [src[0], src[0], src[0], src[1]],
+                _ => return Err("unsupported JPEG XL channels".into()),
+            };
+        }
+    }
+    Ok(rgba)
 }
 
 pub(super) fn preview(file: File, limit: usize) -> Result<(Pixels, bool)> {

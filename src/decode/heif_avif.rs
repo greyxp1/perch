@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-fn heif_result(error: heif::heif_error) -> Result<()> {
+pub(crate) fn heif_result(error: heif::heif_error) -> Result<()> {
     if error.code == heif::heif_error_code_heif_error_Ok {
         Ok(())
     } else {
@@ -25,30 +25,34 @@ fn heif_result(error: heif::heif_error) -> Result<()> {
 }
 
 handle! {
-    HeifContext(heif::heif_context) = heif::heif_context_free;
+    pub(crate) HeifContext(heif::heif_context) = heif::heif_context_free;
     HeifTrack(heif::heif_track) = heif::heif_track_release;
-    HeifImage(heif::heif_image) = heif::heif_image_release;
+    pub(crate) HeifImage(heif::heif_image) = heif::heif_image_release;
     HeifOptions(heif::heif_decoding_options) = heif::heif_decoding_options_free;
-    HeifHandle(heif::heif_image_handle) = heif::heif_image_handle_release;
+    pub(crate) HeifHandle(heif::heif_image_handle) = heif::heif_image_handle_release;
 }
 
-struct HeifPoster<'a> {
-    handle: HeifHandle,
+pub(crate) struct HeifPoster<'a> {
+    pub(crate) handle: HeifHandle,
     context: &'a HeifContext,
 }
 
 impl HeifContext {
-    fn open(file: &File) -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         static INIT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
         INIT.get_or_init(|| {
             heif_result(unsafe { heif::heif_init(null_mut()) }).map_err(|e| e.to_string())
         })
         .as_ref()
         .map_err(String::as_str)?;
-        let context = Self(
+        Ok(Self(
             NonNull::new(unsafe { heif::heif_context_alloc() })
                 .ok_or("could not allocate HEIF context")?,
-        );
+        ))
+    }
+
+    fn open(file: &File) -> Result<Self> {
+        let context = Self::new()?;
         let path = CString::new(crate::fd_path(file))?;
         // The file reader opens and owns a separate descriptor for the context.
         heif_result(unsafe {
@@ -57,11 +61,11 @@ impl HeifContext {
         Ok(context)
     }
 
-    fn has_sequence(&self) -> bool {
+    pub(crate) fn has_sequence(&self) -> bool {
         unsafe { heif::heif_context_has_sequence(self.0.as_ptr()) != 0 }
     }
 
-    fn poster(&self) -> Result<HeifPoster<'_>> {
+    pub(crate) fn poster(&self) -> Result<HeifPoster<'_>> {
         let mut handle = null_mut();
         heif_result(unsafe {
             heif::heif_context_get_primary_image_handle(self.0.as_ptr(), &mut handle)
@@ -73,7 +77,7 @@ impl HeifContext {
     }
 }
 
-fn heif_decode(
+pub(crate) fn heif_decode(
     passthrough: bool,
     decode: impl FnOnce(
         *mut *mut heif::heif_image,
@@ -115,8 +119,8 @@ fn heif_icc(
     Ok(Some(data))
 }
 
-type Nclx = (u32, u32);
-fn heif_nclx(
+pub(crate) type Nclx = (u32, u32);
+pub(crate) fn heif_nclx(
     read: impl FnOnce(*mut *mut heif::heif_color_profile_nclx) -> heif::heif_error,
 ) -> Option<Nclx> {
     let mut profile = null_mut();
@@ -141,7 +145,7 @@ impl HeifPoster<'_> {
         }
     }
 
-    fn icc(&self) -> Result<Option<Vec<u8>>> {
+    pub(crate) fn icc(&self) -> Result<Option<Vec<u8>>> {
         let handle = self.handle.0.as_ptr();
         unsafe {
             heif_icc(
@@ -249,9 +253,13 @@ fn heif_color(
     if profile.is_some() {
         return crate::color::Transform::new(profile);
     }
-    let Some((primaries, transfer)) = nclx else {
-        return Ok(None);
-    };
+    nclx.and_then(cicp_profile)
+        .map(crate::color::Transform::profile)
+        .transpose()
+}
+
+/// Describes decoded RGB with NCLX primaries and transfer, treating unspecified values as sRGB.
+pub(crate) fn cicp_profile((primaries, transfer): Nclx) -> Option<moxcms::ColorProfile> {
     let primaries = match u8::try_from(primaries).unwrap_or(0) {
         2 => 1,
         n => n,
@@ -260,25 +268,20 @@ fn heif_color(
         2 => 13,
         n => n,
     };
-    let (Ok(primaries), Ok(transfer)) = (
-        moxcms::CicpColorPrimaries::try_from(primaries),
-        moxcms::TransferCharacteristics::try_from(transfer),
-    ) else {
-        return Ok(None);
-    };
+    let primaries = moxcms::CicpColorPrimaries::try_from(primaries).ok()?;
+    let transfer = moxcms::TransferCharacteristics::try_from(transfer).ok()?;
     if moxcms::ColorPrimaries::try_from(primaries).is_err()
         || moxcms::ToneReprCurve::try_from(transfer).is_err()
     {
-        return Ok(None);
+        return None;
     }
-    crate::color::Transform::profile(moxcms::ColorProfile::new_from_cicp(moxcms::CicpProfile {
+    Some(moxcms::ColorProfile::new_from_cicp(moxcms::CicpProfile {
         color_primaries: primaries,
         transfer_characteristics: transfer,
         // The decoder already applied the YCbCr matrix and range to produce RGB.
         matrix_coefficients: moxcms::MatrixCoefficients::Identity,
         full_range: true,
     }))
-    .map(Some)
 }
 const HEIF_RGBA: heif::heif_channel = heif::heif_channel_heif_channel_interleaved;
 
@@ -294,7 +297,7 @@ impl HeifImage {
     }
 }
 
-fn heif_rgba(image: &HeifImage, premultiplied: bool) -> Result<RgbaImage> {
+pub(crate) fn heif_rgba(image: &HeifImage, premultiplied: bool) -> Result<RgbaImage> {
     let (width, height) = image.size()?;
     let mut rgba = RgbaImage::new(width, height);
     heif_copy(image, rgba.as_mut(), premultiplied)?;
@@ -429,4 +432,12 @@ pub(super) fn frames(file: File) -> Result<(Frames<'static>, LoopCount)> {
     }
     let frames = Frames::new(Box::new(HeifFrames::new(context)?));
     Ok((frames, LoopCount::Finite(NonZeroU32::MIN)))
+}
+
+/// Decodes the first frame of a sequence as sRGB.
+pub(crate) fn sequence_frame(context: HeifContext) -> Result<RgbaImage> {
+    let frame = HeifFrames::new(context)?
+        .next()
+        .ok_or("HEIF sequence has no frames")??;
+    Ok(frame.into_buffer())
 }

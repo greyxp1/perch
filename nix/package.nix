@@ -1,10 +1,14 @@
 {
+  brotli,
   cmake,
   cxxRuntime,
   dejavu_fonts,
   lib,
+  libaom,
   libjpeg,
   libheif,
+  libhwy,
+  libjxl,
   imagemagick,
   libraw,
   lcms2,
@@ -31,16 +35,34 @@ let
     # Upstream tests require the omitted command-line codecs.
     doCheck = false;
   });
-  heif = libheif.overrideAttrs (old: {
+  # Dav1d decodes AV1, so libaom only encodes.
+  aom = (libaom.override {enableVmaf = false;}).overrideAttrs (old: {
+    cmakeFlags = old.cmakeFlags ++ ["-DCONFIG_AV1_DECODER=0" "-DENABLE_EXAMPLES=0" "-DENABLE_TOOLS=0"];
+  });
+  heif = (libheif.override {libaom = aom;}).overrideAttrs (old: {
     outputs = ["out" "dev" "lib"];
     nativeBuildInputs = [cmake pkg-config];
-    propagatedBuildInputs = [dav1d libde265 jpeg jpeg2000];
+    propagatedBuildInputs = [aom dav1d libde265 jpeg jpeg2000];
     cmakeFlags = (old.cmakeFlags or []) ++ [
       "-DENABLE_PLUGIN_LOADING=OFF" "-DWITH_EXAMPLES=OFF" "-DWITH_GDK_PIXBUF=OFF"
-      "-DWITH_X265=OFF" "-DWITH_X264=OFF" "-DWITH_AOM_ENCODER=OFF" "-DWITH_AOM_DECODER=OFF"
+      "-DWITH_X265=OFF" "-DWITH_X264=OFF" "-DWITH_AOM_ENCODER=ON" "-DWITH_AOM_DECODER=OFF"
       "-DWITH_DAV1D=ON" "-DWITH_JPEG_DECODER=ON" "-DWITH_OpenJPEG_DECODER=ON"
     ];
     postInstall = "";
+  });
+  # Only the encoder is used. Jxl-oxide decodes.
+  jxl = (libjxl.override {enablePlugins = false;}).overrideAttrs (old: {
+    outputs = ["out" "dev"];
+    nativeBuildInputs = [cmake pkg-config];
+    depsBuildBuild = [];
+    buildInputs = [];
+    propagatedBuildInputs = [brotli libhwy cms];
+    cmakeFlags = lib.remove "-DJPEGXL_FORCE_SYSTEM_GTEST=ON" old.cmakeFlags ++ [
+      "-DJPEGXL_ENABLE_TOOLS=OFF" "-DJPEGXL_ENABLE_BENCHMARK=OFF" "-DJPEGXL_ENABLE_EXAMPLES=OFF"
+      "-DJPEGXL_ENABLE_DOXYGEN=OFF" "-DJPEGXL_ENABLE_MANPAGES=OFF" "-DJPEGXL_ENABLE_TCMALLOC=OFF"
+    ];
+    postInstall = "";
+    doCheck = false;
   });
   # Inputs are replaced below, so only switches that add configure flags matter.
   photoshop = (imagemagick.override {
@@ -123,6 +145,7 @@ in lib.overrideDerivation (rustPlatform.buildRustPackage {
     jpeg
     dav1d
     heif
+    jxl
     ((libraw.override {lcms2 = cms;}).overrideAttrs (old: {
       configureFlags = (old.configureFlags or []) ++ ["--disable-examples" "--disable-openmp"];
     }))
@@ -154,6 +177,8 @@ in lib.overrideDerivation (rustPlatform.buildRustPackage {
     install -Dm644 ${photoshop.src}/LICENSE "$out/share/licenses/perch/ImageMagick"
     install -Dm644 ${heif.src}/COPYING "$out/share/licenses/perch/libheif"
     install -Dm644 ${libde265.src}/COPYING "$out/share/licenses/perch/libde265"
+    install -Dm644 ${aom.src}/LICENSE "$out/share/licenses/perch/libaom"
+    install -Dm644 ${jxl.src}/LICENSE "$out/share/licenses/perch/libjxl"
   '';
   # Static applications do not propagate their link-time dependencies.
   postFixup = ''
