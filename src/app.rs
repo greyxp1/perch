@@ -13,7 +13,8 @@ use std::{
 use wayland_client::{
     QueueHandle,
     protocol::{
-        wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_pointer, wl_seat, wl_shm, wl_surface,
+        wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager,
+        wl_data_offer, wl_data_source, wl_keyboard, wl_pointer, wl_seat, wl_shm, wl_surface,
     },
 };
 use wayland_protocols::{
@@ -24,6 +25,8 @@ use worker::{Action, Done, Job, Output, Step, Token, Worker};
 use xkb::keysyms;
 use xkbcommon::xkb;
 
+mod editor;
+mod hud;
 mod wayland;
 mod worker;
 
@@ -41,6 +44,11 @@ struct Seat {
     repeat_rate: i32,
     repeat_delay: i32,
     repeating: Option<(u32, u32, Instant)>,
+    /// The latest key or button serial, which clipboard requests need.
+    serial: u32,
+    data_device: Option<wl_data_device::WlDataDevice>,
+    /// The newest offer from other clients, kept only to destroy it once replaced.
+    offer: Option<wl_data_offer::WlDataOffer>,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Work {
@@ -76,6 +84,13 @@ struct Pin {
     next_frame: Instant,
     callback: Option<(wl_callback::WlCallback, Instant)>,
     visible: bool,
+    editor: Option<Box<editor::Editor>>,
+    /// The latest rendered frame, shown under the HUD and toast.
+    base: Option<Arc<Frame>>,
+    toast: Option<(String, Instant)>,
+    /// Whether the HUD or toast changed since the last commit, and when it may next redraw.
+    redraw: bool,
+    next_redraw: Instant,
 }
 impl Pin {
     fn neighbor(&self, direction: isize) -> usize {
@@ -102,6 +117,8 @@ impl Pin {
             " [loading]"
         } else if self.playing {
             " [playing]"
+        } else if self.editing() {
+            " [editing]"
         } else if self.inspect {
             " [inspect]"
         } else {
@@ -110,10 +127,10 @@ impl Pin {
         self.toplevel.set_title(format!("Perch: {name}{state}"));
     }
     fn fit(&self) -> f64 {
-        fit_zoom(self.source.size, self.bounds)
+        fit_zoom(self.content(), self.bounds)
     }
     fn fit_in(&self, area: (i32, i32), margin: f64) -> f64 {
-        fit_in(self.source.size, area, margin)
+        fit_in(self.content(), area, margin)
     }
     fn center_image(&mut self) {
         self.center = (
@@ -122,7 +139,10 @@ impl Pin {
         );
     }
     fn size_to_zoom(&mut self) {
-        self.size = scaled(self.source.size, self.zoom);
+        self.size = scaled(self.content(), self.zoom);
+    }
+    fn overlay(&self) -> bool {
+        self.editing() || self.toast.is_some()
     }
     fn initial_size(&mut self) {
         self.zoom = self.fit();
@@ -223,6 +243,10 @@ struct App {
     worker: Option<Worker>,
     next_id: u64,
     abgr: bool,
+    data_manager: Option<wl_data_device_manager::WlDataDeviceManager>,
+    /// The selection Perch offers until another client replaces it.
+    clipboard: Option<wl_data_source::WlDataSource>,
+    labels: hud::Labels,
 }
 impl App {
     fn id(&mut self) -> u64 {
@@ -292,6 +316,11 @@ impl App {
             next_frame: Instant::now(),
             callback: None,
             visible: true,
+            editor: None,
+            base: None,
+            toast: None,
+            redraw: false,
+            next_redraw: Instant::now(),
         };
         pin.initial_size();
         pin.title();
@@ -347,21 +376,39 @@ impl App {
         let Some(pin) = self.pins.get_mut(&id) else {
             return;
         };
-        if pin.paths.len() < 2 || pin.request.is_some() {
+        if pin.paths.len() < 2 || pin.request.is_some() || pin.editor.is_some() {
             return;
         }
+        let index = pin.neighbor(direction);
+        let path = pin.paths[index].clone();
+        self.load(id, index, direction, path);
+    }
+    /// Loads the image an overwrite replaced.
+    fn reload(&mut self, id: u64) {
+        let Some(pin) = self.pins.get_mut(&id) else {
+            return;
+        };
+        let Some(path) = pin.source.path().map(PathBuf::from) else {
+            return;
+        };
+        pin.close_editor();
+        let (index, direction) = (pin.index, pin.direction);
+        self.load(id, index, direction, path);
+    }
+    fn load(&mut self, id: u64, index: usize, direction: isize, path: PathBuf) {
+        let pin = self.pins.get_mut(&id).unwrap();
         // An idle pin can only have speculative work outstanding. Keep it alive
         // if this load or the following ones will use its results.
         if pin.work != Work::Idle || pin.direction != direction {
             worker::cancel(&pin.token);
         }
-        pin.index = pin.neighbor(direction);
+        pin.index = index;
         pin.direction = direction;
         pin.work = Work::Loading;
         pin.playing = false;
         pin.callback = None;
         pin.title();
-        let input = Input::Path(pin.paths[pin.index].clone());
+        let input = Input::Path(path);
         // The queue retains only the latest request for this pin.
         if !self.worker.as_ref().unwrap().submit(Job {
             id,
@@ -375,9 +422,36 @@ impl App {
             self.preload(id);
         }
     }
-    fn key(&mut self, id: u64, key: u32) {
-        if key == keysyms::KEY_q || key == keysyms::KEY_Q {
+    fn key(
+        &mut self,
+        id: u64,
+        key: u32,
+        (ctrl, shift): (bool, bool),
+        seat: u32,
+        qh: &QueueHandle<Self>,
+    ) {
+        // Letters match without case so Caps Lock never turns a save into an overwrite.
+        let key = if (keysyms::KEY_A..=keysyms::KEY_Z).contains(&key) {
+            key + (keysyms::KEY_a - keysyms::KEY_A)
+        } else {
+            key
+        };
+        match key {
+            keysyms::KEY_c if ctrl => return self.copy(id, seat, qh),
+            keysyms::KEY_s if ctrl => return self.save(id, shift),
+            keysyms::KEY_z if ctrl => return self.undo(id, shift),
+            keysyms::KEY_y if ctrl => return self.undo(id, true),
+            _ => {}
+        }
+        if key == keysyms::KEY_q {
             self.close_pin(id);
+            return;
+        }
+        if key == keysyms::KEY_e {
+            self.toggle_edit(id);
+            return;
+        }
+        if self.editing(id) && self.edit_key(id, key, shift) {
             return;
         }
         if key == keysyms::KEY_Left || key == keysyms::KEY_Right {
@@ -387,7 +461,7 @@ impl App {
         let Some(pin) = self.pins.get_mut(&id) else {
             return;
         };
-        if pin.work == Work::Loading {
+        if pin.work == Work::Loading || pin.editor.is_some() {
             return;
         }
         match key {
@@ -502,6 +576,36 @@ impl App {
                 _ => {}
             }
         }
+        for apply in self.worker.as_ref().unwrap().finished() {
+            apply(self, qh);
+        }
+    }
+    /// Attaches the latest frame, with the HUD and toast drawn over it when shown.
+    fn attach(&mut self, id: u64, qh: &QueueHandle<Self>) {
+        let Some(pin) = self.pins.get_mut(&id) else {
+            return;
+        };
+        let Some(base) = pin.base.clone() else {
+            return;
+        };
+        let frame = if pin.overlay() {
+            hud::compose(pin, &base, &mut self.labels).unwrap_or_else(|error| {
+                eprintln!("perch: {error}");
+                base
+            })
+        } else {
+            base
+        };
+        let buffer = frame.buffer(self.shm.as_ref().unwrap(), self.abgr, qh);
+        if let Some(old) = pin.buffer.replace(buffer.clone()) {
+            old.destroy();
+        }
+        pin.viewport.set_destination(pin.size.0, pin.size.1);
+        pin.surface.attach(Some(&buffer), 0, 0);
+        pin.surface.damage_buffer(0, 0, frame.width, frame.height);
+        pin.redraw = false;
+        // Pointer motion arrives far faster than displays refresh.
+        pin.next_redraw = Instant::now() + Duration::from_millis(8);
     }
     fn present(
         &mut self,
@@ -512,12 +616,10 @@ impl App {
         qh: &QueueHandle<Self>,
     ) {
         let pin = self.pins.get_mut(&id).unwrap();
-        let buffer = frame.buffer(self.shm.as_ref().unwrap(), self.abgr, qh);
-        let old = pin.buffer.replace(buffer.clone());
-        let first = old.inspect(wl_buffer::WlBuffer::destroy).is_none();
-        pin.viewport.set_destination(pin.size.0, pin.size.1);
-        pin.surface.attach(Some(&buffer), 0, 0);
-        pin.surface.damage_buffer(0, 0, frame.width, frame.height);
+        let first = pin.buffer.is_none();
+        pin.base = Some(frame);
+        self.attach(id, qh);
+        let pin = self.pins.get_mut(&id).unwrap();
         if stepped {
             pin.ended = delay.is_none();
             if let Some(delay) = delay {
@@ -568,9 +670,24 @@ impl App {
                 let seat = self.seats.get_mut(&name).unwrap();
                 seat.repeating.as_mut().unwrap().2 =
                     now + Duration::from_secs_f64(1.0 / f64::from(seat.repeat_rate));
-                self.key(id, key);
+                self.key(id, key, (false, false), name, qh);
             }
         }
+        for pin in self.pins.values_mut() {
+            if pin.toast.as_ref().is_some_and(|(_, until)| *until <= now) {
+                pin.toast = None;
+                pin.redraw = true;
+            }
+        }
+        let redraws: Vec<_> = (self.pins.iter())
+            .filter(|(_, pin)| pin.redraw && pin.base.is_some() && pin.next_redraw <= now)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in redraws {
+            self.attach(id, qh);
+            self.pins[&id].surface.commit();
+        }
+        let swap = !self.abgr;
         let worker = self.worker.as_ref().unwrap();
         for (&id, pending) in &mut self.pending {
             if let PendingState::Queued(inputs) = &pending.state
@@ -586,6 +703,10 @@ impl App {
         }
         for (&id, pin) in &mut self.pins {
             if !pin.configured || pin.work == Work::Loading {
+                continue;
+            }
+            if pin.editor.is_some() {
+                editor::schedule(id, pin, worker, swap);
                 continue;
             }
             if pin.playing && !pin.visible && pin.callback.is_none() {
@@ -628,8 +749,15 @@ impl App {
                     && pin.callback.is_none()
             })
             .map(|pin| pin.next_frame);
+        let overlays = self.pins.values().flat_map(|pin| {
+            let redraw = (pin.redraw && pin.base.is_some()).then_some(pin.next_redraw);
+            redraw
+                .into_iter()
+                .chain(pin.toast.as_ref().map(|(_, until)| *until))
+        });
         repeats
             .chain(frames)
+            .chain(overlays)
             .filter(|&deadline| deadline > now)
             .min()
             .map(|deadline| deadline - now)

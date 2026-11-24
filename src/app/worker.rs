@@ -294,15 +294,20 @@ fn lookahead(swap: bool, workers: usize) {
         ahead = lock.lock().unwrap();
     }
 }
+/// Applies the result of a task to the app on the main thread.
+pub(super) type Apply = Box<dyn FnOnce(&mut super::App, &super::QueueHandle<super::App>) + Send>;
 pub(super) struct Worker {
     queue: Arc<(Mutex<VecDeque<Job>>, Condvar)>,
     pub(super) wake: UnixStream,
     results: Receiver<Done>,
+    notify: UnixStream,
+    tasks: (mpsc::Sender<Apply>, Receiver<Apply>),
 }
 impl Worker {
     pub(super) fn new(swap: bool) -> std::io::Result<Self> {
         let (wake, mut notify) = UnixStream::pair()?;
         wake.set_nonblocking(true)?;
+        let task_notify = notify.try_clone()?;
         let (sender, results) = mpsc::sync_channel(2);
         let queue = Arc::new((Mutex::new(VecDeque::<Job>::new()), Condvar::new()));
         let work = queue.clone();
@@ -441,7 +446,29 @@ impl Worker {
             queue,
             wake,
             results,
+            notify: task_notify,
+            tasks: mpsc::channel(),
         })
+    }
+    /// Runs an editing task on its own thread, keeping long encodes off the image worker.
+    /// Returns false when no thread could start.
+    pub(super) fn spawn(&self, task: impl FnOnce() -> Apply + Send + 'static) -> bool {
+        let Ok(mut notify) = self.notify.try_clone() else {
+            return false;
+        };
+        let sender = self.tasks.0.clone();
+        let thread = std::thread::Builder::new().name("perch-edit".into());
+        thread
+            .spawn(move || {
+                if sender.send(task()).is_ok() {
+                    let _ = notify.write_all(&[1]);
+                }
+            })
+            .is_ok()
+    }
+    /// Takes finished tasks after `drain` consumed their wakeups.
+    pub(super) fn finished(&self) -> Vec<Apply> {
+        self.tasks.1.try_iter().collect()
     }
     pub(super) fn submit(&self, job: Job) -> bool {
         let (lock, ready) = &*self.queue;

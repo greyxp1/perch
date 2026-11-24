@@ -25,6 +25,7 @@ mod app;
 mod color;
 mod decode;
 mod document;
+mod edit;
 mod encode;
 mod ipc;
 mod overview;

@@ -311,6 +311,12 @@ impl Source {
     pub fn path(&self) -> Option<&Path> {
         self.input.path()
     }
+    /// Reads the encoded image.
+    pub fn read(&self) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.input.file()?.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
     pub fn bytes(&self) -> usize {
         match &self.data {
             Data::Raster { frame, .. } => frame.bytes(),

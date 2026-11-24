@@ -1,4 +1,4 @@
-use super::{App, Seat, Work, worker::Worker};
+use super::{App, Seat, Work, editor::Clip, worker::Worker};
 use crate::{Result, ipc, shm::Frame};
 use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
@@ -6,15 +6,18 @@ use rustix::{
 };
 use std::{
     fs::File,
+    io::Write,
     os::fd::{AsFd, OwnedFd},
     os::unix::fs::FileExt,
+    sync::Arc,
     time::{Duration, Instant},
 };
 use wayland_client::{
-    Connection, Dispatch, Proxy, QueueHandle, WEnum, delegate_noop,
+    Connection, Dispatch, Proxy, QueueHandle, WEnum, delegate_noop, event_created_child,
     protocol::{
-        wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_pointer, wl_registry, wl_seat,
-        wl_shm, wl_shm_pool, wl_surface,
+        wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager,
+        wl_data_offer, wl_data_source, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm,
+        wl_shm_pool, wl_surface,
     },
 };
 use wayland_protocols::{
@@ -86,10 +89,13 @@ dispatch!(
                 }
                 "wp_viewporter" => state.viewporter = Some(registry.bind(name, 1, qh, ())),
                 "wl_seat" if version >= 5 => {
+                    let wl: wl_seat::WlSeat = registry.bind(name, 5, qh, name);
+                    let data_device = (state.data_manager.as_ref())
+                        .map(|manager| manager.get_data_device(&wl, qh, name));
                     state.seats.insert(
                         name,
                         Seat {
-                            wl: registry.bind(name, 5, qh, name),
+                            wl,
                             pointer: None,
                             keyboard: None,
                             pin: None,
@@ -100,8 +106,19 @@ dispatch!(
                             repeat_rate: 0,
                             repeat_delay: 0,
                             repeating: None,
+                            serial: 0,
+                            data_device,
+                            offer: None,
                         },
                     );
+                }
+                "wl_data_device_manager" if version >= 3 => {
+                    let manager: wl_data_device_manager::WlDataDeviceManager =
+                        registry.bind(name, 3, qh, ());
+                    for (&name, seat) in &mut state.seats {
+                        seat.data_device = Some(manager.get_data_device(&seat.wl, qh, name));
+                    }
+                    state.data_manager = Some(manager);
                 }
                 _ => {}
             },
@@ -112,6 +129,12 @@ dispatch!(
                     }
                     if let Some(keyboard) = seat.keyboard {
                         keyboard.release();
+                    }
+                    if let Some(offer) = seat.offer {
+                        offer.destroy();
+                    }
+                    if let Some(device) = seat.data_device {
+                        device.release();
                     }
                     seat.wl.release();
                 }
@@ -213,8 +236,11 @@ dispatch!(wl_pointer::WlPointer, u32, |state, _, event, name, _| {
             seat.position = (surface_x, surface_y);
         }
         wl_pointer::Event::Leave { .. } => {
-            seat.pin = None;
+            let pin = seat.pin.take();
             seat.dragging = false;
+            if let Some(id) = pin {
+                state.edit_leave(id);
+            }
         }
         wl_pointer::Event::Motion {
             surface_x,
@@ -223,9 +249,12 @@ dispatch!(wl_pointer::WlPointer, u32, |state, _, event, name, _| {
         } => {
             let old = seat.position;
             seat.position = (surface_x, surface_y);
-            if seat.dragging
-                && let Some(pin) = seat.pin.and_then(|id| state.pins.get_mut(&id))
+            let (pin, dragging) = (seat.pin, seat.dragging);
+            if let Some(id) = pin
+                && state.editing(id)
             {
+                state.edit_motion(id, (surface_x, surface_y));
+            } else if dragging && let Some(pin) = pin.and_then(|id| state.pins.get_mut(&id)) {
                 pin.center.0 -= (surface_x - old.0) / pin.zoom;
                 pin.center.1 -= (surface_y - old.1) / pin.zoom;
                 pin.clamp_center();
@@ -238,22 +267,31 @@ dispatch!(wl_pointer::WlPointer, u32, |state, _, event, name, _| {
             state: WEnum::Value(pressed),
             ..
         } => {
-            if let Some(id) = seat.pin {
-                if button == 0x110 {
-                    if pressed == wl_pointer::ButtonState::Pressed {
-                        if let Some(pin) = state.pins.get(&id) {
-                            if pin.inspect {
-                                seat.dragging = true;
-                            } else {
-                                pin.toplevel._move(&seat.wl, serial);
-                            }
-                        }
-                    } else {
-                        seat.dragging = false;
-                    }
-                } else if button == 0x111 && pressed == wl_pointer::ButtonState::Pressed {
-                    state.close_pin(id);
+            seat.serial = serial;
+            let Some(id) = seat.pin else {
+                return;
+            };
+            let (position, wl) = (seat.position, seat.wl.clone());
+            let pressed = pressed == wl_pointer::ButtonState::Pressed;
+            let editing = state.editing(id);
+            match button {
+                0x110 if !pressed => {
+                    state.seats.get_mut(name).unwrap().dragging = false;
+                    state.edit_release(id);
                 }
+                0x110 if editing && state.edit_press(id, position) => {}
+                0x110 => {
+                    if let Some(pin) = state.pins.get(&id) {
+                        if pin.inspect {
+                            state.seats.get_mut(name).unwrap().dragging = true;
+                        } else {
+                            pin.toplevel._move(&wl, serial);
+                        }
+                    }
+                }
+                0x111 if pressed && editing => state.edit_back(id),
+                0x111 if pressed => state.close_pin(id),
+                _ => {}
             }
         }
         wl_pointer::Event::Axis {
@@ -261,14 +299,16 @@ dispatch!(wl_pointer::WlPointer, u32, |state, _, event, name, _| {
             value,
             ..
         } => {
-            if let Some(pin) = seat.pin.and_then(|id| state.pins.get_mut(&id)) {
+            if let Some(pin) = seat.pin.and_then(|id| state.pins.get_mut(&id))
+                && !pin.editing()
+            {
                 pin.zoom(value);
             }
         }
         _ => {}
     }
 });
-dispatch!(wl_keyboard::WlKeyboard, u32, |state, _, event, name, _| {
+dispatch!(wl_keyboard::WlKeyboard, u32, |state, _, event, name, qh| {
     let Some(seat) = state.seats.get_mut(name) else {
         return;
     };
@@ -323,10 +363,12 @@ dispatch!(wl_keyboard::WlKeyboard, u32, |state, _, event, name, _| {
             seat.repeating = None;
         }
         wl_keyboard::Event::Key {
+            serial,
             key,
             state: WEnum::Value(pressed),
             ..
         } => {
+            seat.serial = serial;
             if pressed == wl_keyboard::KeyState::Released {
                 if seat.repeating.is_some_and(|(held, _, _)| held == key) {
                     seat.repeating = None;
@@ -337,10 +379,20 @@ dispatch!(wl_keyboard::WlKeyboard, u32, |state, _, event, name, _| {
                         (
                             keys.key_get_one_sym(code.into()).raw(),
                             keys.get_keymap().key_repeats(code.into()),
+                            (
+                                keys.mod_name_is_active(
+                                    xkb::MOD_NAME_CTRL,
+                                    xkb::STATE_MODS_EFFECTIVE,
+                                ),
+                                keys.mod_name_is_active(
+                                    xkb::MOD_NAME_SHIFT,
+                                    xkb::STATE_MODS_EFFECTIVE,
+                                ),
+                            ),
                         )
                     })
                 });
-                if let Some((symbol, repeats)) = symbol {
+                if let Some((symbol, repeats, mods)) = symbol {
                     if repeats {
                         seat.repeating = None;
                     }
@@ -354,7 +406,7 @@ dispatch!(wl_keyboard::WlKeyboard, u32, |state, _, event, name, _| {
                             Instant::now() + Duration::from_millis(seat.repeat_delay as u64),
                         ));
                     }
-                    state.key(id, symbol);
+                    state.key(id, symbol, mods, *name, qh);
                 }
             }
         }
@@ -371,6 +423,64 @@ dispatch!(wl_callback::WlCallback, u64, |state, callback, _, id, _| {
     }
 });
 
+impl Dispatch<wl_data_device::WlDataDevice, u32> for App {
+    fn event(
+        state: &mut Self,
+        _: &wl_data_device::WlDataDevice,
+        event: wl_data_device::Event,
+        name: &u32,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // Perch never pastes, so each offer is destroyed once a newer one has replaced it.
+        if let wl_data_device::Event::DataOffer { id } = event {
+            match state.seats.get_mut(name) {
+                Some(seat) => {
+                    if let Some(old) = seat.offer.replace(id) {
+                        old.destroy();
+                    }
+                }
+                None => id.destroy(),
+            }
+        }
+    }
+    event_created_child!(App, wl_data_device::WlDataDevice, [
+        wl_data_device::EVT_DATA_OFFER_OPCODE => (wl_data_offer::WlDataOffer, ()),
+    ]);
+}
+dispatch!(
+    wl_data_source::WlDataSource,
+    Arc<Clip>,
+    |state, source, event, clip, _| {
+        match event {
+            wl_data_source::Event::Send { fd, .. } => {
+                // A slow paste target only holds up this thread.
+                let clip = clip.clone();
+                let _ = std::thread::Builder::new()
+                    .name("perch-paste".into())
+                    .spawn(move || {
+                        let flags = rustix::fs::fcntl_getfl(&fd);
+                        if let Ok(flags) = flags {
+                            let _ =
+                                rustix::fs::fcntl_setfl(&fd, flags - rustix::fs::OFlags::NONBLOCK);
+                        }
+                        if let Some(bytes) = clip.wait() {
+                            let _ = File::from(fd).write_all(&bytes);
+                        }
+                    });
+            }
+            wl_data_source::Event::Cancelled => {
+                if state.clipboard.as_ref() == Some(source) {
+                    state.clipboard = None;
+                }
+                source.destroy();
+            }
+            _ => {}
+        }
+    }
+);
+delegate_noop!(App: ignore wl_data_offer::WlDataOffer);
+delegate_noop!(App: ignore wl_data_device_manager::WlDataDeviceManager);
 delegate_noop!(App: ignore wl_compositor::WlCompositor);
 dispatch!(wl_surface::WlSurface, u64, |state, _, event, id, _| {
     if let wl_surface::Event::PreferredBufferScale { factor } = event

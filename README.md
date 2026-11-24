@@ -14,6 +14,12 @@ Your compositor must support xdg-shell v4 and viewporter.
 - Tab: toggle inspection, where left drag pans and the wheel zooms
 - Home: fit the image
 - End: show at original size
+- Ctrl+C: copy the image
+- E: toggle editing, with toolbar buttons and keys to crop (C), rotate (R and
+  Shift+R), flip (H and V), adjust tone (T), resize (Z) and export (X)
+- While editing, Enter applies a crop, Escape or right click cancels or leaves,
+  Ctrl+Z and Ctrl+Shift+Z undo and redo, Ctrl+S saves a copy next to the image
+  and Ctrl+Shift+S overwrites it
 
 ## Usage
 

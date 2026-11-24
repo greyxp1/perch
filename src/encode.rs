@@ -17,6 +17,8 @@ mod png;
 mod raster;
 mod webp;
 
+pub use png::fast as fast_png;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     Png,

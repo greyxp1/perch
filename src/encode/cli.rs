@@ -156,7 +156,7 @@ pub fn run(command: &str, args: &[OsString]) -> Result<()> {
             check(target, overwrite)?;
             let bytes = fs::read(source)?;
             let output = super::convert(Raster::load(&bytes, Some(source))?, &options)?;
-            write(source, target, &output, overwrite)?;
+            write(Some(source), target, &output, overwrite)?;
             Ok(format!(
                 "{} -> {}: {} -> {}",
                 source.display(),
@@ -194,7 +194,7 @@ pub fn run(command: &str, args: &[OsString]) -> Result<()> {
                     size(bytes.len())
                 ));
             };
-            write(source, target, &output, overwrite)?;
+            write(Some(source), target, &output, overwrite)?;
             let saved = 100 - output.len() * 100 / bytes.len();
             Ok(format!(
                 "{}: {} -> {} (-{saved}%)",
@@ -261,8 +261,14 @@ fn check(target: &Path, overwrite: bool) -> Result<()> {
     Ok(())
 }
 
-/// Writes a temporary file beside the target and renames it into place.
-fn write(source: &Path, target: &Path, bytes: &[u8], overwrite: bool) -> Result<()> {
+/// Writes a temporary file beside the target and renames it into place, with the
+/// permissions of `source` when there is one.
+pub(crate) fn write(
+    source: Option<&Path>,
+    target: &Path,
+    bytes: &[u8],
+    overwrite: bool,
+) -> Result<()> {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let name = target.file_name().ok_or("invalid output path")?;
     let (temp, mut file) = loop {
@@ -278,7 +284,7 @@ fn write(source: &Path, target: &Path, bytes: &[u8], overwrite: bool) -> Result<
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(0o600)
+            .mode(if source.is_some() { 0o600 } else { 0o666 })
             .open(&temp);
         match file {
             Ok(file) => break (temp, file),
@@ -288,16 +294,20 @@ fn write(source: &Path, target: &Path, bytes: &[u8], overwrite: bool) -> Result<
     };
     let result = (|| -> Result<()> {
         file.write_all(bytes)?;
-        file.set_permissions(fs::metadata(source)?.permissions())?;
+        if let Some(source) = source {
+            file.set_permissions(fs::metadata(source)?.permissions())?;
+        }
         file.sync_all()?;
         if overwrite {
             fs::rename(&temp, target)?;
         } else {
             renameat_with(CWD, &temp, CWD, target, RenameFlags::NOREPLACE).map_err(|e| {
                 if e == rustix::io::Errno::EXIST {
-                    format!("{} exists, use --overwrite to replace it", target.display())
+                    let text =
+                        format!("{} exists, use --overwrite to replace it", target.display());
+                    std::io::Error::new(ErrorKind::AlreadyExists, text)
                 } else {
-                    e.to_string()
+                    e.into()
                 }
             })?;
         }
@@ -339,7 +349,7 @@ fn batch(
     }
 }
 
-fn size(bytes: usize) -> String {
+pub(crate) fn size(bytes: usize) -> String {
     let mut value = bytes as f64;
     for unit in ["B", "KiB", "MiB"] {
         if value < 1024.0 {

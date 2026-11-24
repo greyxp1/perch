@@ -11,6 +11,11 @@ const DISPLAY: [&[u8; 4]; 15] = [
 ];
 
 pub fn encode(raster: &Raster) -> Result<Vec<u8>> {
+    optimize_encoded(write(raster, png::ColorType::Rgba, &raster.rgba, None)?)
+}
+
+/// Encodes quickly without recompressing, for the clipboard.
+pub fn fast(raster: &Raster) -> Result<Vec<u8>> {
     write(raster, png::ColorType::Rgba, &raster.rgba, None)
 }
 
@@ -32,12 +37,12 @@ pub fn quantize(raster: &Raster, quality: u8) -> Result<Vec<u8>> {
     while trns.last() == Some(&255) {
         trns.pop();
     }
-    write(
+    optimize_encoded(write(
         raster,
         png::ColorType::Indexed,
         &indices,
         Some((plte, trns)),
-    )
+    )?)
 }
 
 fn write(
@@ -56,7 +61,7 @@ fn write(
     }
     let mut out = Vec::new();
     let mut encoder = png::Encoder::with_info(&mut out, info)?;
-    // Oxipng recompresses the image data.
+    // Oxipng recompresses saved images and the clipboard favors speed.
     encoder.set_compression(png::Compression::Fastest);
     if let Some(xmp) = &raster.xmp {
         encoder.add_itxt_chunk("XML:com.adobe.xmp".into(), String::from_utf8(xmp.clone())?)?;
@@ -64,8 +69,13 @@ fn write(
     let mut writer = encoder.write_header()?;
     writer.write_image_data(data)?;
     writer.finish()?;
+    Ok(out)
+}
+
+/// Recompresses the image data that `write` stored quickly.
+fn optimize_encoded(png: Vec<u8>) -> Result<Vec<u8>> {
     Ok(oxipng::optimize_from_memory(
-        &out,
+        &png,
         &oxipng::Options::default(),
     )?)
 }
