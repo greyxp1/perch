@@ -105,9 +105,13 @@ pub fn scaled(source: (u32, u32), zoom: f64) -> (i32, i32) {
         (f64::from(source.1) * zoom).round().max(1.0) as i32,
     )
 }
+/// The zoom a newly loaded image opens with.
+pub fn fit_zoom(source: (u32, u32), bounds: (i32, i32)) -> f64 {
+    fit_in(source, bounds, 0.9).min(1.0)
+}
 /// The view a newly loaded image opens with.
 pub fn fit_view(source: (u32, u32), bounds: (i32, i32), scale: i32) -> View {
-    let size = scaled(source, fit_in(source, bounds, 0.9).min(1.0));
+    let size = scaled(source, fit_zoom(source, bounds));
     view(source, size, scale, None)
 }
 pub fn view(
@@ -250,19 +254,12 @@ impl Source {
                 },
             }));
         }
-        let dimensions = |(w, h): (u32, u32)| -> Result<()> {
-            if u64::from(w) * u64::from(h) > limit as u64 / 4 {
-                return Err("image exceeds the decoded memory budget".into());
-            }
-            Ok(())
-        };
+        if format == Some(ImageFormat::Png) {
+            let (pixels, animated) = Pixels::png(reader, limit, cancelled)?;
+            let playback = animated.then_some(Playback::Png);
+            return Self::pixels(input, pixels, playback, swap, format);
+        }
         let animated = match format {
-            Some(ImageFormat::Png) => {
-                let decoder =
-                    image::codecs::png::PngDecoder::with_limits(&mut reader, limits(limit))?;
-                dimensions(decoder.dimensions())?;
-                decoder.is_apng()?.then_some(Playback::Png)
-            }
             Some(ImageFormat::WebP) => {
                 let mut header = [0; 64];
                 let length = reader.read(&mut header)?;
@@ -274,7 +271,9 @@ impl Source {
                         (decoder.dimensions(), decoder.has_animation())
                     }
                 };
-                dimensions(size)?;
+                if u64::from(size.0) * u64::from(size.1) > limit as u64 / 4 {
+                    return Err("image exceeds the decoded memory budget".into());
+                }
                 animated.then_some(Playback::WebP)
             }
             Some(ImageFormat::Gif) => Some(Playback::Gif),
@@ -332,24 +331,24 @@ impl Source {
     /// Bounds the memory rendering `view` of the whole image allocates beyond `bytes`.
     pub fn fit_bytes(&self, view: View) -> usize {
         let pixels = |(w, h): (u32, u32)| w as usize * h as usize;
+        // Resampling runs a vertical pass first into a source-wide RGBA8 buffer at the output
+        // height, and the larger side bounds that width before orienting.
+        let scratch = |(w, h): (u32, u32)| pixels((w.max(h), view.height)) * 4;
         // Orienting copies decoded pixels up to three times, and area filtering
         // accumulates 32 bytes per output pixel besides its result.
         let decoded = |size: (u32, u32)| {
             if pixels(size) > crate::RENDER_BYTES / 8 {
-                pixels(crate::overview::fit(size, view.width.max(view.height))) * 36
+                let reduced = crate::overview::fit(size, view.width.max(view.height));
+                pixels(reduced) * 36 + scratch(reduced)
             } else {
-                pixels(size) * 16
+                pixels(size) * 16 + scratch(size)
             }
         };
+        let full = (0.0, 0.0, f64::from(self.size.0), f64::from(self.size.1));
         let output = (view.width, view.height);
         (pixels(output) * 4).saturating_add(match &self.data {
             Data::Tiff { levels, .. } => {
-                let level = (levels.iter())
-                    .rfind(|l| {
-                        let (w, h) = oriented((l.width, l.height), self.orientation);
-                        w >= output.0 && h >= output.1
-                    })
-                    .unwrap_or(&levels[0]);
+                let level = self.level(levels, full, output);
                 decoded((level.width, level.height))
                     .saturating_add(level.chunk_bytes.saturating_mul(3))
             }
@@ -357,8 +356,22 @@ impl Source {
                 frame,
                 format: Some(_),
             } if self.coarse(frame, view) => decoded(self.size),
-            Data::Raster { .. } => 0,
+            Data::Raster { frame, .. } => scratch((frame.width as u32, frame.height as u32)),
         })
+    }
+    /// The smallest TIFF level that still covers `output` pixels across `rect`.
+    fn level<'a>(
+        &self,
+        levels: &'a [Level],
+        rect: (f64, f64, f64, f64),
+        output: (u32, u32),
+    ) -> &'a Level {
+        let covers = |l: &&Level| {
+            let (w, h) = oriented((l.width, l.height), self.orientation);
+            (rect.2 - rect.0) * f64::from(w) / f64::from(self.size.0) >= f64::from(output.0)
+                && (rect.3 - rect.1) * f64::from(h) / f64::from(self.size.1) >= f64::from(output.1)
+        };
+        levels.iter().rfind(covers).unwrap_or(&levels[0])
     }
     pub fn render(
         &self,
@@ -442,15 +455,7 @@ impl Source {
         swap: bool,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(Arc<Frame>, [f64; 4])> {
-        let mut level = &levels[0];
-        for candidate in levels {
-            let (w, h) = oriented((candidate.width, candidate.height), self.orientation);
-            if (rect.2 - rect.0) * f64::from(w) / f64::from(self.size.0) >= f64::from(output.0)
-                && (rect.3 - rect.1) * f64::from(h) / f64::from(self.size.1) >= f64::from(output.1)
-            {
-                level = candidate;
-            }
-        }
+        let level = self.level(levels, rect, output);
         let size = oriented((level.width, level.height), self.orientation);
         let sx = f64::from(size.0) / f64::from(self.size.0);
         let sy = f64::from(size.1) / f64::from(self.size.1);

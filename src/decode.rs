@@ -30,7 +30,6 @@ impl Pixels {
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Self> {
         match format {
-            Some(ImageFormat::Png) => Self::png(reader, cancelled),
             Some(format @ (ImageFormat::Jpeg | ImageFormat::WebP)) => {
                 Self::native(reader, format, limit, 1920, cancelled)
             }

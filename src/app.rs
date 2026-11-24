@@ -1,5 +1,5 @@
 use crate::{
-    document::{Input, Source, View, fit_in, scaled, view},
+    document::{Input, Source, View, fit_in, fit_zoom, scaled, view},
     ipc,
     shm::Frame,
 };
@@ -110,7 +110,7 @@ impl Pin {
         self.toplevel.set_title(format!("Perch: {name}{state}"));
     }
     fn fit(&self) -> f64 {
-        self.fit_in(self.bounds, 0.9).min(1.0)
+        fit_zoom(self.source.size, self.bounds)
     }
     fn fit_in(&self, area: (i32, i32), margin: f64) -> f64 {
         fit_in(self.source.size, area, margin)

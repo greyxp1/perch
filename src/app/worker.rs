@@ -1,4 +1,4 @@
-use crate::document::{self, Animation, Input, Source, View};
+use crate::document::{self, Animation, Input, Source, View, fit_view};
 use crate::shm::Frame;
 use std::{
     collections::{HashMap, VecDeque},
@@ -6,7 +6,7 @@ use std::{
     os::unix::{fs::MetadataExt, net::UnixStream},
     path::{Path, PathBuf},
     sync::{
-        Arc, Condvar, LazyLock, Mutex,
+        Arc, Condvar, LazyLock, Mutex, PoisonError,
         atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver},
     },
@@ -84,9 +84,16 @@ struct Plan {
     generation: u64,
     token: Token,
     paths: Vec<PathBuf>,
-    next: usize,
-    screen: ((i32, i32), i32),
+    /// Paths no worker took yet, and whether each retries without concurrent reservations.
+    pending: Vec<(PathBuf, bool)>,
+    screen: Screen,
 }
+impl Plan {
+    fn live(&self) -> bool {
+        self.token.load(Ordering::Relaxed) == self.generation
+    }
+}
+type Screen = ((i32, i32), i32);
 type Stamp = (u64, u64, i64, i64);
 fn stamp(path: &Path) -> Option<Stamp> {
     let meta = std::fs::metadata(path).ok()?;
@@ -104,20 +111,115 @@ impl Entry {
         self.source.bytes() + self.frame.as_ref().map_or(0, |f| f.1.bytes())
     }
 }
+/// Speculative work on one path and the bytes it may still allocate.
+#[derive(Clone)]
+struct Claim {
+    key: u64,
+    id: u64,
+    generation: u64,
+    token: Token,
+    path: PathBuf,
+    bytes: usize,
+}
+impl Claim {
+    fn live(&self) -> bool {
+        self.token.load(Ordering::Relaxed) == self.generation
+    }
+}
+/// Releases a claim and its reservation however its work ends.
+struct Held(u64);
+impl Drop for Held {
+    fn drop(&mut self) {
+        let (lock, ready) = &*AHEAD;
+        (lock.lock().unwrap_or_else(PoisonError::into_inner).claims).retain(|c| c.key != self.0);
+        ready.notify_all();
+    }
+}
 #[derive(Default)]
 struct Ahead {
     plans: HashMap<u64, Plan>,
     cache: Vec<Entry>,
-    busy: Option<PathBuf>,
+    claims: Vec<Claim>,
+    keys: u64,
+}
+impl Ahead {
+    fn cached(&self) -> usize {
+        self.cache.iter().map(Entry::bytes).sum()
+    }
+    /// The budget left beside the cache and every claim except `key`.
+    fn free(&self, key: u64) -> usize {
+        let reserved = (self.claims.iter())
+            .filter(|c| c.key != key)
+            .map(|c| c.bytes);
+        CACHE_BYTES.saturating_sub(self.cached() + reserved.sum::<usize>())
+    }
+    fn reserve(&mut self, key: u64, bytes: usize) {
+        if let Some(claim) = self.claims.iter_mut().find(|c| c.key == key) {
+            claim.bytes = bytes;
+        }
+    }
+    /// Claims the nearest pending path no live claim covers, reserving its decode budget.
+    /// Returns the claim, its screen and whether sharing the budget lowered its limit.
+    fn claim(&mut self, workers: usize) -> Option<(Held, Claim, Screen, bool)> {
+        loop {
+            let free = self.free(0);
+            if free == 0 {
+                return None;
+            }
+            let alone = self.claims.iter().all(|c| c.bytes == 0);
+            let (id, index) = (self.plans.iter())
+                .filter(|p| p.1.live())
+                .find_map(|(&id, p)| {
+                    if !alone && p.pending.first().is_some_and(|(_, retry)| *retry) {
+                        return None;
+                    }
+                    let index = p.pending.iter().position(|(path, retry)| {
+                        (alone || !retry)
+                            && !(self.claims.iter()).any(|c| c.live() && &c.path == path)
+                    });
+                    index.map(|index| (id, index))
+                })?;
+            let plan = self.plans.get_mut(&id).unwrap();
+            let (path, retry) = plan.pending.remove(index);
+            let (token, generation, (bounds, scale)) =
+                (plan.token.clone(), plan.generation, plan.screen);
+            // A source cached without a frame had no room to render one.
+            if (self.cache.iter()).any(|e| {
+                e.source.path() == Some(&path)
+                    && (e.frame.as_ref())
+                        .is_none_or(|f| f.0 == fit_view(e.source.size, bounds, scale))
+            }) {
+                continue;
+            }
+            let headroom = CACHE_BYTES.saturating_sub(self.cached());
+            let others = (self.plans.values()).any(|p| p.live() && !p.pending.is_empty());
+            let bytes = if retry || !others {
+                free
+            } else {
+                free.min(headroom / workers)
+            };
+            self.keys += 1;
+            let claim = Claim {
+                key: self.keys,
+                id,
+                generation,
+                token,
+                path,
+                bytes,
+            };
+            self.claims.push(claim.clone());
+            return Some((Held(claim.key), claim, (bounds, scale), bytes < headroom));
+        }
+    }
 }
 // Process-wide so cancellation can wake foreground loads waiting on speculative work.
 static AHEAD: LazyLock<(Mutex<Ahead>, Condvar)> = LazyLock::new(Default::default);
-/// Waits only for live jobs and speculative work on the same path, and only reuses unchanged files.
+/// Waits only for live jobs and live claims on the same path, and only reuses unchanged files.
 fn take(input: &Input, live: impl Fn() -> bool) -> Option<Entry> {
     let path = input.path()?;
     let (lock, ready) = &*AHEAD;
     let mut ahead = lock.lock().unwrap();
-    while ahead.busy.as_deref() == Some(path) && live() {
+    while (ahead.claims.iter()).any(|c| c.live() && c.path == path) && live() {
         ahead = ready.wait(ahead).unwrap();
     }
     if !live() {
@@ -125,8 +227,72 @@ fn take(input: &Input, live: impl Fn() -> bool) -> Option<Entry> {
     }
     let index = (ahead.cache.iter()).position(|e| e.source.path() == Some(path))?;
     let entry = ahead.cache.swap_remove(index);
+    ready.notify_all();
     drop(ahead);
     (stamp(path) == Some(entry.stamp)).then_some(entry)
+}
+/// Decodes and fits upcoming images within the shared budget.
+fn lookahead(swap: bool, workers: usize) {
+    let (lock, ready) = &*AHEAD;
+    let mut ahead = lock.lock().unwrap();
+    loop {
+        let Some((held, claim, (bounds, scale), shared)) = ahead.claim(workers) else {
+            ahead = ready.wait(ahead).unwrap();
+            continue;
+        };
+        drop(ahead);
+        let path = &claim.path;
+        let cancelled = || !claim.live();
+        let entry = (|| -> crate::Result<Entry> {
+            // Stamping first makes a replacement during decoding look stale.
+            let stamp = stamp(path).ok_or("cannot read image metadata")?;
+            let source = Source::load(Input::Path(path.clone()), swap, claim.bytes, &cancelled)?;
+            let view = fit_view(source.size, bounds, scale);
+            let need = source.bytes() + source.fit_bytes(view);
+            let render = {
+                let mut ahead = lock.lock().unwrap();
+                let render = need <= ahead.free(claim.key);
+                let next = if render { need } else { source.bytes() };
+                ahead.reserve(claim.key, next);
+                if next < claim.bytes {
+                    ready.notify_all();
+                }
+                render
+            };
+            let frame = render
+                .then(|| source.render(view, None, swap, &cancelled))
+                .transpose()?
+                .map(|frame| (view, frame));
+            Ok(Entry {
+                id: claim.id,
+                source,
+                stamp,
+                frame,
+            })
+        })();
+        ahead = lock.lock().unwrap();
+        let current =
+            claim.live() && (ahead.plans.get(&claim.id)).is_some_and(|p| p.paths.contains(path));
+        match entry {
+            Ok(entry) if current => {
+                ahead.cache.retain(|e| e.source.path() != Some(path));
+                if entry.bytes() <= ahead.free(claim.key) {
+                    ahead.cache.push(entry);
+                }
+                ahead.reserve(claim.key, 0);
+            }
+            // A budget shared with concurrent work may have rejected what a lone worker fits.
+            Err(_) if current && shared => {
+                let pending = &mut ahead.plans.get_mut(&claim.id).unwrap().pending;
+                pending.retain(|p| &p.0 != path);
+                pending.insert(0, (path.clone(), true));
+            }
+            _ => {}
+        }
+        drop(ahead);
+        drop(held);
+        ahead = lock.lock().unwrap();
+    }
 }
 pub(super) struct Worker {
     queue: Arc<(Mutex<VecDeque<Job>>, Condvar)>,
@@ -262,67 +428,15 @@ impl Worker {
                     }
                 }
             })?;
-        std::thread::Builder::new()
-            .name("perch-ahead".into())
-            .spawn(move || {
-                let (lock, ready) = &*AHEAD;
-                let mut ahead = lock.lock().unwrap();
-                loop {
-                    let Some((&id, plan)) = (ahead.plans.iter_mut()).find(|(_, p)| {
-                        p.next < p.paths.len() && p.token.load(Ordering::Relaxed) == p.generation
-                    }) else {
-                        ahead = ready.wait(ahead).unwrap();
-                        continue;
-                    };
-                    plan.next += 1;
-                    let path = plan.paths[plan.next - 1].clone();
-                    let (token, generation, (bounds, scale)) =
-                        (plan.token.clone(), plan.generation, plan.screen);
-                    let fit = |source: &Source| document::fit_view(source.size, bounds, scale);
-                    // A source cached without a frame had no room to render one.
-                    if (ahead.cache.iter()).any(|e| {
-                        e.source.path() == Some(&path)
-                            && (e.frame.as_ref()).is_none_or(|f| f.0 == fit(&e.source))
-                    }) {
-                        continue;
-                    }
-                    let used = ahead.cache.iter().map(Entry::bytes).sum::<usize>();
-                    ahead.busy = Some(path.clone());
-                    drop(ahead);
-                    let live = || token.load(Ordering::Relaxed) == generation;
-                    let entry = (|| -> crate::Result<Entry> {
-                        // Stamping first makes a replacement during decoding look stale.
-                        let stamp = stamp(&path).ok_or("cannot read image metadata")?;
-                        let input = Input::Path(path.clone());
-                        let limit = CACHE_BYTES.saturating_sub(used);
-                        let source = Source::load(input, swap, limit, &|| !live())?;
-                        let view = fit(&source);
-                        let frame = (source.bytes() + source.fit_bytes(view) <= limit)
-                            .then(|| source.render(view, None, swap, &|| !live()))
-                            .transpose()?
-                            .map(|frame| (view, frame));
-                        Ok(Entry {
-                            id,
-                            source,
-                            stamp,
-                            frame,
-                        })
-                    })();
-                    ahead = lock.lock().unwrap();
-                    ahead.busy = None;
-                    if let Ok(entry) = entry
-                        && live()
-                        && (ahead.plans.get(&id)).is_some_and(|p| p.paths.contains(&path))
-                    {
-                        ahead.cache.retain(|e| e.source.path() != Some(&path));
-                        let used = ahead.cache.iter().map(Entry::bytes).sum::<usize>();
-                        if used + entry.bytes() <= CACHE_BYTES {
-                            ahead.cache.push(entry);
-                        }
-                    }
-                    ready.notify_all();
-                }
-            })?;
+        // Several cores leave room for a second speculative worker beside the foreground.
+        let workers = match std::thread::available_parallelism().map_or(1, |n| n.get()) {
+            4.. => 2,
+            _ => 1,
+        };
+        for _ in 0..workers {
+            (std::thread::Builder::new().name("perch-ahead".into()))
+                .spawn(move || lookahead(swap, workers))?;
+        }
         Ok(Self {
             queue,
             wake,
@@ -341,13 +455,7 @@ impl Worker {
         true
     }
     /// Retargets speculative work for pin `id` and evicts its entries outside `paths`.
-    pub(super) fn ahead(
-        &self,
-        id: u64,
-        token: &Token,
-        paths: Vec<PathBuf>,
-        screen: ((i32, i32), i32),
-    ) {
+    pub(super) fn ahead(&self, id: u64, token: &Token, paths: Vec<PathBuf>, screen: Screen) {
         let (lock, ready) = &*AHEAD;
         let mut ahead = lock.lock().unwrap();
         let generation = token.load(Ordering::Relaxed);
@@ -361,8 +469,8 @@ impl Worker {
         let plan = Plan {
             generation,
             token: token.clone(),
+            pending: paths.iter().map(|p| (p.clone(), false)).collect(),
             paths,
-            next: 0,
             screen,
         };
         ahead.plans.insert(id, plan);
@@ -376,7 +484,11 @@ impl Worker {
     pub(super) fn forget(&self, id: u64) {
         let mut ahead = AHEAD.0.lock().unwrap();
         ahead.plans.remove(&id);
+        let before = ahead.cache.len();
         ahead.cache.retain(|e| e.id != id);
+        if ahead.cache.len() < before {
+            AHEAD.1.notify_all();
+        }
         drop(ahead);
         let _ = self.submit(Job {
             id,

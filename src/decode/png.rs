@@ -4,23 +4,42 @@ use image::metadata::Orientation;
 use std::io::{BufRead, Seek};
 
 impl Pixels {
-    pub(super) fn png(reader: impl BufRead + Seek, cancelled: &dyn Fn() -> bool) -> Result<Self> {
-        let mut png = Png::open(reader)?;
+    /// Decodes a PNG or APNG poster and reports whether the file is animated.
+    pub fn png(
+        reader: impl BufRead + Seek,
+        limit: usize,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(Self, bool)> {
+        let mut png = Png::open(reader, limit)?;
         let (width, height, _) = png.header();
-        if u64::from(width) * u64::from(height) > crate::RENDER_BYTES as u64 / 8 {
-            return Self::png_stream(
-                png,
-                (0, 0, width, height),
-                crate::overview::fit((width, height), 2048),
-                cancelled,
-            );
+        let area = u64::from(width) * u64::from(height);
+        let rotated = png
+            .reader
+            .info()
+            .exif_metadata
+            .as_deref()
+            .and_then(Orientation::from_exif_chunk)
+            .is_some_and(|o| o != Orientation::NoTransforms);
+        if area > limit as u64 / if rotated { 12 } else { 4 } {
+            return Err("image exceeds the decoded memory budget".into());
+        }
+        let animated = png.reader.info().animation_control.is_some();
+        if area > crate::RENDER_BYTES as u64 / 8 {
+            let size = crate::overview::fit((width, height), 2048);
+            let pixels = Self::png_stream(png, (0, 0, width, height), size, cancelled)?;
+            return Ok((pixels, animated));
         }
         let mut pixels = Self::new(width.try_into()?, height.try_into()?)?;
-        png.decode(&mut pixels.mapping)?;
+        png.decode(&mut pixels.mapping, cancelled)?;
         let orientation = png.orientation()?;
+        if orientation != Orientation::NoTransforms && area > limit as u64 / 12 {
+            return Err("image exceeds the decoded memory budget".into());
+        }
         pixels.apply_color(png.color()?, false)?;
-        pixels.premultiply()?;
-        pixels.orient(orientation)
+        if !png.opaque() {
+            pixels.premultiply()?;
+        }
+        Ok((pixels.orient(orientation)?, animated))
     }
     pub fn png_region(
         reader: impl BufRead + Seek,
@@ -29,7 +48,7 @@ impl Pixels {
         size: (u32, u32),
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Self> {
-        let png = Png::open(reader)?;
+        let png = Png::open(reader, usize::MAX)?;
         let (width, height, _) = png.header();
         if (width, height) != expected {
             return Err("image changed while open".into());
@@ -51,7 +70,7 @@ impl Pixels {
         let mut row = Vec::new();
         row.try_reserve_exact(len)?;
         row.resize(len, 0);
-        let alpha = MulDiv::default();
+        let alpha = (!png.opaque()).then(MulDiv::default);
         loop {
             if cancelled() {
                 return Err("image loading cancelled".into());
@@ -68,12 +87,10 @@ impl Pixels {
                     if let Some(color) = &mut color {
                         color.apply(data, false)?;
                     }
-                    alpha.multiply_alpha_inplace(&mut Image::from_slice_u8(
-                        end - first,
-                        1,
-                        data,
-                        U8x4,
-                    )?)?;
+                    if let Some(alpha) = &alpha {
+                        let mut image = Image::from_slice_u8(end - first, 1, data, U8x4)?;
+                        alpha.multiply_alpha_inplace(&mut image)?;
+                    }
                     let x = start + first * step;
                     if step == 1 {
                         raster.row(x, y, data)?;
@@ -110,13 +127,13 @@ struct Png<R: BufRead + Seek> {
     rows: Box<dyn Iterator<Item = (u32, u32, u32)>>,
 }
 impl<R: BufRead + Seek> Png<R> {
-    fn open(reader: R) -> Result<Self> {
+    fn open(reader: R, limit: usize) -> Result<Self> {
         let mut options = png::DecodeOptions::default();
         options.set_ignore_adler32(false);
         options.set_ignore_text_chunk(true);
         let mut decoder = png::Decoder::new_with_options(reader, options);
         // Perch budgets pixels itself, and the default limit rejects large metadata chunks.
-        decoder.set_limits(png::Limits { bytes: usize::MAX });
+        decoder.set_limits(png::Limits { bytes: limit });
         decoder.set_transformations(
             png::Transformations::EXPAND
                 | png::Transformations::STRIP_16
@@ -149,8 +166,41 @@ impl<R: BufRead + Seek> Png<R> {
     fn color(&self) -> Result<Option<crate::color::Transform>> {
         crate::color::Transform::new(self.reader.info().icc_profile.as_deref())
     }
-    fn decode(&mut self, pixels: &mut [u8]) -> Result<()> {
-        if self.reader.next_frame(pixels)?.color_type == png::ColorType::GrayscaleAlpha {
+    fn opaque(&self) -> bool {
+        let info = self.reader.info();
+        info.trns.is_none()
+            && matches!(
+                info.color_type,
+                png::ColorType::Rgb | png::ColorType::Grayscale | png::ColorType::Indexed
+            )
+    }
+    /// Decodes the first frame row by row so cancellation can stop it.
+    fn decode(&mut self, pixels: &mut [u8], cancelled: &dyn Fn() -> bool) -> Result<()> {
+        let color = self.reader.output_color_type().0;
+        let info = self.reader.info();
+        let stride = (self.reader.output_line_size(info.width)).ok_or("PNG row is too large")?;
+        // Adam7 passes decode into a scratch row, while plain rows decode in place.
+        let mut pass = vec![0; if info.interlaced { stride } else { 0 }];
+        let mut y = 0;
+        loop {
+            if cancelled() {
+                return Err("image loading cancelled".into());
+            }
+            let row = if pass.is_empty() {
+                &mut pixels[y * stride..]
+            } else {
+                &mut pass
+            };
+            match self.reader.read_row(row)? {
+                None => break,
+                Some(png::InterlaceInfo::Null(_)) => y += 1,
+                Some(png::InterlaceInfo::Adam7(info)) => {
+                    let bits = color.samples() as u8 * 8;
+                    png::expand_interlaced_row(pixels, stride, &pass, &info, bits);
+                }
+            }
+        }
+        if color == png::ColorType::GrayscaleAlpha {
             expand_gray(pixels, pixels.len() / 4);
         }
         Ok(())
