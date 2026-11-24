@@ -19,7 +19,8 @@ pub mod psd_raw;
 mod tiff;
 
 pub use self::tiff::Tiff;
-pub use jpeg_webp::webp_info;
+pub(crate) use jpeg_webp::{DecodeFailed, Jpeg, jpeg_errors};
+pub use jpeg_webp::{webp_features, webp_info};
 
 impl Pixels {
     pub fn load(

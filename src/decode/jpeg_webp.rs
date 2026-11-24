@@ -117,6 +117,14 @@ impl Pixels {
         pixels.orient(orientation)
     }
 
+    /// Decodes a whole JPEG to upright sRGB, converting CMYK through its profile.
+    pub fn jpeg(bytes: &[u8]) -> Result<Self> {
+        Self::encoded(bytes, ImageFormat::Jpeg, |header| {
+            let size = header.dimensions();
+            decode_jpeg(bytes, size, (1, 1), (0, 0, size.0, size.1), size, &|| false)
+        })
+    }
+
     fn webp(
         bytes: &[u8],
         rect: (u32, u32, u32, u32),
@@ -177,7 +185,7 @@ impl Pixels {
     }
 }
 
-struct Jpeg(jpeg_decompress_struct);
+pub(crate) struct Jpeg(pub(crate) jpeg_decompress_struct);
 impl Drop for Jpeg {
     fn drop(&mut self) {
         unsafe { jpeg_destroy_decompress(&mut self.0) };
@@ -186,9 +194,23 @@ impl Drop for Jpeg {
 
 handle! { Transform(c_void) = cmsDeleteTransform; }
 
-struct DecodeFailed;
+pub(crate) struct DecodeFailed;
 unsafe extern "C-unwind" fn fail(_: j_common_ptr) {
     resume_unwind(Box::new(DecodeFailed));
+}
+
+/// Initializes a libjpeg error manager whose fatal errors unwind as `DecodeFailed`.
+pub(crate) fn jpeg_errors(error: &mut MaybeUninit<jpeg_error_mgr>) -> *mut jpeg_error_mgr {
+    let error = unsafe { jpeg_std_error(error.as_mut_ptr()) };
+    // The header's callbacks have C function pointer types. Libjpeg is built with
+    // unwind support and calls these only while inside a catch_unwind.
+    unsafe {
+        (*error).error_exit = Some(transmute::<
+            unsafe extern "C-unwind" fn(j_common_ptr),
+            unsafe extern "C" fn(j_common_ptr),
+        >(fail));
+    }
+    error
 }
 
 unsafe extern "C-unwind" fn progress(jpeg: j_common_ptr) {
@@ -241,15 +263,7 @@ fn decode_jpeg(
     let mut error = MaybeUninit::<jpeg_error_mgr>::uninit();
     // Before creation libjpeg requires a zeroed struct with an initialized error manager.
     let mut jpeg = Jpeg(unsafe { std::mem::zeroed() });
-    jpeg.0.err = unsafe { jpeg_std_error(error.as_mut_ptr()) };
-    // The header's callbacks have C function pointer types. Libjpeg is built with
-    // unwind support and calls these only while inside the catch_unwind below.
-    unsafe {
-        (*jpeg.0.err).error_exit = Some(transmute::<
-            unsafe extern "C-unwind" fn(j_common_ptr),
-            unsafe extern "C" fn(j_common_ptr),
-        >(fail));
-    }
+    jpeg.0.err = jpeg_errors(&mut error);
     let mut monitor = jpeg_progress_mgr {
         progress_monitor: Some(unsafe {
             transmute::<unsafe extern "C-unwind" fn(j_common_ptr), unsafe extern "C" fn(j_common_ptr)>(
@@ -388,9 +402,9 @@ fn decode_jpeg(
     }
 }
 
-pub fn webp_info(bytes: &[u8]) -> Result<((u32, u32), bool)> {
+pub fn webp_features(bytes: &[u8]) -> Result<codec_ffi::WebPBitstreamFeatures> {
     let mut features = std::mem::MaybeUninit::<codec_ffi::WebPBitstreamFeatures>::uninit();
-    let features = unsafe {
+    unsafe {
         if codec_ffi::WebPGetFeaturesInternal(
             bytes.as_ptr(),
             bytes.len(),
@@ -400,8 +414,12 @@ pub fn webp_info(bytes: &[u8]) -> Result<((u32, u32), bool)> {
         {
             return Err("invalid WebP header".into());
         }
-        features.assume_init()
-    };
+        Ok(features.assume_init())
+    }
+}
+
+pub fn webp_info(bytes: &[u8]) -> Result<((u32, u32), bool)> {
+    let features = webp_features(bytes)?;
     if features.width <= 0 || features.height <= 0 {
         return Err("invalid WebP dimensions".into());
     }

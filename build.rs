@@ -7,23 +7,25 @@ fn main() {
         "MagickWand",
         "libtiff-4",
         "libjpeg",
-        "libwebpdecoder",
+        "libwebpmux",
     ];
     let mut bindings = bindgen::Builder::default()
         .header_contents(
             "perch-codecs.h",
-            "#include <libraw/libraw.h>\n#include <MagickWand/MagickWand.h>\n#include <lcms2.h>\n#include <webp/decode.h>\n#include <tiffio.h>\n#include <stdio.h>\n#include <jpeglib.h>\nenum PerchCmsFormat { RGBA8 = TYPE_RGBA_8, GRAY8 = TYPE_GRAY_8, CMYK8 = TYPE_CMYK_8 };",
+            "#include <libraw/libraw.h>\n#include <MagickWand/MagickWand.h>\n#include <lcms2.h>\n#include <webp/decode.h>\n#include <webp/encode.h>\n#include <webp/mux.h>\n#include <tiffio.h>\n#include <stdio.h>\n#include <jpeglib.h>\nenum PerchCmsFormat { RGBA8 = TYPE_RGBA_8, GRAY8 = TYPE_GRAY_8, CMYK8 = TYPE_CMYK_8 };",
         )
         .allowlist_function("libraw_(init|open_file|close|unpack|set_progress_handler|dcraw_(process|make_mem_image|clear_mem))")
         .allowlist_function("(New|Destroy)MagickWand|Magick(WandGenesis|SetProgressMonitor|ReadImage|SetFirstIterator|GetImage(Width|Height|Profile)|RelinquishMemory|ProfileImage|TransformImageColorspace|ExportImagePixels)")
         .allowlist_function("cms(Create_sRGBProfile|SaveProfileToMem|CloseProfile|OpenProfileFromMem|GetColorSpace|CreateTransform|DeleteTransform|DoTransform)")
-        .allowlist_function("jpeg_(CreateDecompress|destroy_decompress|std_error|mem_src|save_markers|read_(header|icc_profile|scanlines)|start_decompress|(crop|skip)_scanline[s]?)")
+        .allowlist_function("jpeg_(CreateDecompress|destroy_decompress|std_error|mem_src|save_markers|read_(header|icc_profile|scanlines|coefficients)|start_decompress|(crop|skip)_scanline[s]?|CreateCompress|destroy_compress|set_defaults|set_quality|simple_progression|start_compress|write_(scanlines|marker|icc_profile|coefficients)|finish_compress|copy_critical_parameters)")
         .allowlist_function("TIFF(Close|FdOpen|(Get|Set)Field|CurrentDirOffset|SetSubDirectory|ReadDirectory|IsTiled|IsCODECConfigured|GetStrile(Offset|ByteCount)|ReadScanline|RGBAImageOK|ReadRGBA(ImageOriented|StripExt|TileExt))")
         .allowlist_type("PerchCmsFormat")
-        .allowlist_var("JPEG_(LIB_VERSION|APP0)|INTENT_RELATIVE_COLORIMETRIC")
+        .allowlist_var("JPEG_(LIB_VERSION|APP0|COM)|INTENT_RELATIVE_COLORIMETRIC")
         .override_abi(bindgen::Abi::CUnwind, "jpeg_.*")
-        .allowlist_function("WebP(InitDecoderConfigInternal|GetFeaturesInternal|Decode|FreeDecBuffer)")
-        .allowlist_var("WEBP_DECODER_ABI_VERSION")
+        .allowlist_function("WebP(InitDecoderConfigInternal|GetFeaturesInternal|Decode|FreeDecBuffer|Free)")
+        .allowlist_function("WebP(ConfigInitInternal|ConfigLosslessPreset|ValidateConfig|PictureInitInternal|PictureImportRGBA|PictureFree|Encode|MemoryWrite(rInit|rClear)?)")
+        .allowlist_function("WebPMux(CreateInternal|(Get|Set|Delete)Chunk|Assemble|Delete)")
+        .allowlist_var("WEBP_(DECODER|ENCODER|MUX)_ABI_VERSION")
         .layout_tests(false);
     for library in libraries {
         let mut config = pkg_config::Config::new();
