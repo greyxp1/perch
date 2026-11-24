@@ -1,4 +1,4 @@
-use crate::{Result, codecs::*, image::Pixels};
+use crate::{Result, codec_ffi::*, color::Profile, shm::Pixels};
 use std::{
     ffi::{CStr, CString, c_char, c_int, c_void},
     fs::File,
@@ -11,14 +11,6 @@ handle! {
     Raw(libraw_data_t) = libraw_close;
     RawImage(libraw_processed_image_t) = libraw_dcraw_clear_mem;
     Wand(MagickWand) = DestroyMagickWand;
-    pub(crate) Profile(c_void) = cmsCloseProfile;
-}
-impl Profile {
-    pub(crate) fn srgb() -> Result<Self> {
-        Ok(Self(
-            NonNull::new(unsafe { cmsCreate_sRGBProfile() }).ok_or("cannot create sRGB profile")?,
-        ))
-    }
 }
 
 unsafe extern "C" fn raw_progress(
@@ -161,7 +153,7 @@ fn camera_raw(path: &CStr, limit: usize, cancel: &dyn Fn() -> bool) -> Result<Op
     };
     let mut pixels = Pixels::new(width.try_into()?, height.try_into()?)?;
     let rgb = unsafe { std::slice::from_raw_parts((&raw const (*image_ptr).data).cast(), len) };
-    crate::image::expand_rgb(rgb, &mut pixels.mapping);
+    crate::shm::expand_rgb(rgb, &mut pixels.mapping);
     Ok(Some(pixels))
 }
 

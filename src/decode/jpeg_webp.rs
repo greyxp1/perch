@@ -1,17 +1,181 @@
-use crate::codecs::{
+use crate::codec_ffi::{
     cmsColorSpaceSignature_cmsSigCmykData as CMYK, cmsColorSpaceSignature_cmsSigGrayData as GRAY,
     cmsColorSpaceSignature_cmsSigRgbData as RGB,
 };
 #[cfg(panic = "abort")]
 compile_error!("JPEG error handling requires panic unwinding");
 
-use crate::{Result, codecs::*, image::Pixels, native::Profile, overview::Rasterizer};
+use crate::{
+    Result,
+    codec_ffi::{self, *},
+    color::Profile,
+    overview::Rasterizer,
+    shm::Pixels,
+};
+use image::{ImageDecoder, ImageFormat, ImageReader};
 use std::{
     ffi::c_void,
+    io::{BufRead, Cursor, Read, Seek},
     mem::{MaybeUninit, size_of, transmute},
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     ptr::{NonNull, null_mut},
 };
+
+impl Pixels {
+    pub fn encoded_region(
+        mut reader: impl Read,
+        format: ImageFormat,
+        expected: (u32, u32),
+        rect: (u32, u32, u32, u32),
+        size: (u32, u32),
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Self> {
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes)?;
+        if cancelled() {
+            return Err("image loading cancelled".into());
+        }
+        Self::encoded(&bytes, format, |header| {
+            if header.dimensions() != expected {
+                return Err("image changed while open".into());
+            }
+            if format == ImageFormat::Jpeg {
+                decode_jpeg(&bytes, expected, (1, 1), rect, size, cancelled)
+            } else {
+                Self::webp(&bytes, rect, size, true, header)
+            }
+        })
+    }
+    pub(super) fn native(
+        mut reader: impl BufRead + Seek,
+        format: ImageFormat,
+        limit: usize,
+        max_side: u32,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Self> {
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes)?;
+        let decoded = Self::encoded(&bytes, format, |header| {
+            let (w, h) = header.dimensions();
+            if u64::from(w) * u64::from(h) > limit as u64 / 4 {
+                return Err("image exceeds the decoded memory budget".into());
+            }
+            if format == ImageFormat::Jpeg {
+                // libjpeg-turbo supports every k/8 reduction from 1/8 through 1.
+                let numerator = (1_u32..=8)
+                    .find(|&n| {
+                        (u64::from(w.max(h)) * u64::from(n)).div_ceil(8)
+                            >= u64::from(max_side.min(w.max(h)))
+                    })
+                    .unwrap();
+                let scaled = (
+                    (u64::from(w) * u64::from(numerator)).div_ceil(8) as u32,
+                    (u64::from(h) * u64::from(numerator)).div_ceil(8) as u32,
+                );
+                let size =
+                    if u64::from(scaled.0) * u64::from(scaled.1) > crate::RENDER_BYTES as u64 / 8 {
+                        crate::overview::fit(scaled, 2048)
+                    } else {
+                        scaled
+                    };
+                decode_jpeg(
+                    &bytes,
+                    (w, h),
+                    (numerator, 8),
+                    (0, 0, scaled.0, scaled.1),
+                    size,
+                    cancelled,
+                )
+            } else {
+                let size = if u64::from(w) * u64::from(h) > crate::RENDER_BYTES as u64 / 8 {
+                    crate::overview::fit((w, h), max_side)
+                } else {
+                    (w, h)
+                };
+                Self::webp(&bytes, (0, 0, 0, 0), size, size != (w, h), header)
+            }
+        });
+        match decoded {
+            Err(_) if !cancelled() => Self::decode(Cursor::new(bytes), format, limit),
+            decoded => decoded,
+        }
+    }
+
+    // Decodes JPEG or WebP natively and applies the orientation from the encoded header.
+    fn encoded(
+        bytes: &[u8],
+        format: ImageFormat,
+        decode: impl FnOnce(&mut dyn ImageDecoder) -> Result<Self>,
+    ) -> Result<Self> {
+        let mut header = ImageReader::with_format(Cursor::new(bytes), format);
+        header.no_limits();
+        let mut header = header.into_decoder()?;
+        let orientation = header.orientation()?;
+        let size = header.dimensions();
+        let mut pixels = decode(&mut header)?;
+        pixels.original_size = size;
+        pixels.orient(orientation)
+    }
+
+    fn webp(
+        bytes: &[u8],
+        rect: (u32, u32, u32, u32),
+        size: (u32, u32),
+        scaled: bool,
+        header: &mut dyn ImageDecoder,
+    ) -> Result<Self> {
+        let mut pixels = Self::new(size.0.try_into()?, size.1.try_into()?)?;
+        let crop = (
+            i32::try_from(rect.0)?,
+            i32::try_from(rect.1)?,
+            i32::try_from(rect.2 - rect.0)?,
+            i32::try_from(rect.3 - rect.1)?,
+        );
+        let mut config = std::mem::MaybeUninit::<codec_ffi::WebPDecoderConfig>::uninit();
+        let status = unsafe {
+            if codec_ffi::WebPInitDecoderConfigInternal(
+                config.as_mut_ptr(),
+                codec_ffi::WEBP_DECODER_ABI_VERSION as i32,
+            ) == 0
+            {
+                return Err("incompatible WebP decoder".into());
+            }
+            let mut config = config.assume_init();
+            config.output.colorspace = codec_ffi::WEBP_CSP_MODE_MODE_RGBA;
+            config.output.is_external_memory = 1;
+            config.output.u.RGBA = codec_ffi::WebPRGBABuffer {
+                rgba: pixels.mapping.as_mut_ptr(),
+                stride: pixels.width * 4,
+                size: pixels.mapping.len(),
+            };
+            if crop.2 != 0 {
+                config.options.use_cropping = 1;
+                (
+                    config.options.crop_left,
+                    config.options.crop_top,
+                    config.options.crop_width,
+                    config.options.crop_height,
+                ) = crop;
+            }
+            config.options.use_scaling = i32::from(scaled);
+            config.options.scaled_width = pixels.width;
+            config.options.scaled_height = pixels.height;
+            config.options.use_threads = 1;
+            let status = codec_ffi::WebPDecode(bytes.as_ptr(), bytes.len(), &mut config);
+            codec_ffi::WebPFreeDecBuffer(&mut config.output);
+            status
+        };
+        if status != codec_ffi::VP8StatusCode_VP8_STATUS_OK {
+            return Err("cannot decode WebP".into());
+        }
+        pixels.apply_color(
+            crate::color::Transform::new(header.icc_profile()?.as_deref())?,
+            false,
+        )?;
+        pixels.premultiply()?;
+        Ok(pixels)
+    }
+}
 
 struct Jpeg(jpeg_decompress_struct);
 impl Drop for Jpeg {
@@ -66,7 +230,7 @@ fn color(jpeg: &mut jpeg_decompress_struct, cmyk: bool) -> Option<Transform> {
     Some(transform)
 }
 
-pub fn decode(
+fn decode_jpeg(
     bytes: &[u8],
     expected: (u32, u32),
     scale: (u32, u32),
@@ -222,4 +386,27 @@ pub fn decode(
         Err(e) if e.is::<DecodeFailed>() => Err("cannot decode JPEG region".into()),
         Err(e) => resume_unwind(e),
     }
+}
+
+pub fn webp_info(bytes: &[u8]) -> Result<((u32, u32), bool)> {
+    let mut features = std::mem::MaybeUninit::<codec_ffi::WebPBitstreamFeatures>::uninit();
+    let features = unsafe {
+        if codec_ffi::WebPGetFeaturesInternal(
+            bytes.as_ptr(),
+            bytes.len(),
+            features.as_mut_ptr(),
+            codec_ffi::WEBP_DECODER_ABI_VERSION as i32,
+        ) != codec_ffi::VP8StatusCode_VP8_STATUS_OK
+        {
+            return Err("invalid WebP header".into());
+        }
+        features.assume_init()
+    };
+    if features.width <= 0 || features.height <= 0 {
+        return Err("invalid WebP dimensions".into());
+    }
+    Ok((
+        (features.width as u32, features.height as u32),
+        features.has_animation != 0,
+    ))
 }

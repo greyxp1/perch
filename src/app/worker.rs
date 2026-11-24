@@ -1,5 +1,5 @@
 use crate::document::{self, Animation, Input, Source, View};
-use crate::image::Frame;
+use crate::shm::Frame;
 use std::{
     collections::{HashMap, VecDeque},
     io::{Read, Write},
@@ -15,11 +15,11 @@ use std::{
 
 /// Bounds each speculative decode and all speculative sources and frames together.
 const CACHE_BYTES: usize = 128 * 1024 * 1024;
-pub type Token = Arc<AtomicU64>;
-pub fn token() -> Token {
+pub(super) type Token = Arc<AtomicU64>;
+pub(super) fn token() -> Token {
     Arc::new(AtomicU64::new(0))
 }
-pub fn cancel(token: &Token) -> u64 {
+pub(super) fn cancel(token: &Token) -> u64 {
     let generation = token.fetch_add(1, Ordering::Relaxed) + 1;
     // Locking first keeps a foreground wait on speculative work from missing the wakeup.
     drop(AHEAD.0.lock().unwrap());
@@ -27,12 +27,12 @@ pub fn cancel(token: &Token) -> u64 {
     generation
 }
 #[derive(Clone, Copy)]
-pub enum Step {
+pub(super) enum Step {
     Still,
     Next,
     Restart,
 }
-pub enum Action {
+pub(super) enum Action {
     Open(Arc<crate::ipc::Request>),
     Load(Input),
     Render {
@@ -42,11 +42,11 @@ pub enum Action {
     },
     Forget,
 }
-pub struct Job {
-    pub id: u64,
-    pub generation: u64,
-    pub token: Token,
-    pub action: Action,
+pub(super) struct Job {
+    pub(super) id: u64,
+    pub(super) generation: u64,
+    pub(super) token: Token,
+    pub(super) action: Action,
 }
 impl Job {
     fn live(&self) -> bool {
@@ -62,7 +62,7 @@ impl Job {
         }
     }
 }
-pub enum Output {
+pub(super) enum Output {
     Opened {
         sources: Vec<Arc<Source>>,
         paths: Arc<Vec<PathBuf>>,
@@ -74,10 +74,10 @@ pub enum Output {
         stepped: bool,
     },
 }
-pub struct Done {
-    pub id: u64,
-    pub generation: u64,
-    pub result: std::result::Result<Output, String>,
+pub(super) struct Done {
+    pub(super) id: u64,
+    pub(super) generation: u64,
+    pub(super) result: std::result::Result<Output, String>,
 }
 /// Upcoming paths of one pin, nearest first, and the screen they open on.
 struct Plan {
@@ -128,13 +128,13 @@ fn take(input: &Input, live: impl Fn() -> bool) -> Option<Entry> {
     drop(ahead);
     (stamp(path) == Some(entry.stamp)).then_some(entry)
 }
-pub struct Worker {
+pub(super) struct Worker {
     queue: Arc<(Mutex<VecDeque<Job>>, Condvar)>,
-    pub wake: UnixStream,
+    pub(super) wake: UnixStream,
     results: Receiver<Done>,
 }
 impl Worker {
-    pub fn new(swap: bool) -> std::io::Result<Self> {
+    pub(super) fn new(swap: bool) -> std::io::Result<Self> {
         let (wake, mut notify) = UnixStream::pair()?;
         wake.set_nonblocking(true)?;
         let (sender, results) = mpsc::sync_channel(2);
@@ -278,8 +278,7 @@ impl Worker {
                     let path = plan.paths[plan.next - 1].clone();
                     let (token, generation, (bounds, scale)) =
                         (plan.token.clone(), plan.generation, plan.screen);
-                    let fit =
-                        |source: &Source| crate::display::fit_view(source.size, bounds, scale);
+                    let fit = |source: &Source| document::fit_view(source.size, bounds, scale);
                     // A source cached without a frame had no room to render one.
                     if (ahead.cache.iter()).any(|e| {
                         e.source.path() == Some(&path)
@@ -330,7 +329,7 @@ impl Worker {
             results,
         })
     }
-    pub fn submit(&self, job: Job) -> bool {
+    pub(super) fn submit(&self, job: Job) -> bool {
         let (lock, ready) = &*self.queue;
         let mut queue = lock.lock().unwrap();
         queue.retain(|old| old.id != job.id && old.live());
@@ -342,7 +341,13 @@ impl Worker {
         true
     }
     /// Retargets speculative work for pin `id` and evicts its entries outside `paths`.
-    pub fn ahead(&self, id: u64, token: &Token, paths: Vec<PathBuf>, screen: ((i32, i32), i32)) {
+    pub(super) fn ahead(
+        &self,
+        id: u64,
+        token: &Token,
+        paths: Vec<PathBuf>,
+        screen: ((i32, i32), i32),
+    ) {
         let (lock, ready) = &*AHEAD;
         let mut ahead = lock.lock().unwrap();
         let generation = token.load(Ordering::Relaxed);
@@ -363,12 +368,12 @@ impl Worker {
         ahead.plans.insert(id, plan);
         ready.notify_all();
     }
-    pub fn drain(&self) -> Vec<Done> {
+    pub(super) fn drain(&self) -> Vec<Done> {
         let mut bytes = [0; 64];
         while (&self.wake).read(&mut bytes).is_ok_and(|n| n != 0) {}
         self.results.try_iter().collect()
     }
-    pub fn forget(&self, id: u64) {
+    pub(super) fn forget(&self, id: u64) {
         let mut ahead = AHEAD.0.lock().unwrap();
         ahead.plans.remove(&id);
         ahead.cache.retain(|e| e.id != id);

@@ -1,4 +1,4 @@
-use crate::{Result, image::Pixels};
+use crate::{Result, shm::Pixels};
 
 /// Area filtering accumulates premultiplied colors without retaining the source canvas.
 pub struct Overview {

@@ -5,7 +5,7 @@
     dead_code,
     clippy::all
 )]
-mod codecs {
+mod codec_ffi {
     include!(concat!(env!("OUT_DIR"), "/codecs.rs"));
 }
 
@@ -21,16 +21,13 @@ macro_rules! handle {
     )*};
 }
 
+mod app;
 mod color;
-mod display;
+mod decode;
 mod document;
-mod extra;
-mod image;
 mod ipc;
-mod jpeg;
-mod loader;
-mod native;
 mod overview;
+mod shm;
 
 use std::{ffi::OsString, os::fd::AsRawFd, process::ExitCode};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -43,7 +40,7 @@ fn fd_path(file: &impl AsRawFd) -> String {
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let result = if args.len() == 1 && args[0] == "--daemon" {
-        display::run()
+        app::run()
     } else {
         ipc::run_client(&args)
     };

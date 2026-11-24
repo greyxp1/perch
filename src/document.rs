@@ -1,6 +1,7 @@
 use crate::{
     Result,
-    image::{Frame, Pixels, Tiff, limits, oriented},
+    decode::{Tiff, limits},
+    shm::{Frame, Pixels, oriented},
 };
 use fast_image_resize::{
     PixelType::U8x4,
@@ -28,7 +29,7 @@ pub enum Input {
     File(Arc<File>),
 }
 impl Input {
-    pub(crate) fn file(&self) -> Result<File> {
+    fn file(&self) -> Result<File> {
         match self {
             Self::Path(path) => {
                 let file = File::from(fs::open(
@@ -61,7 +62,7 @@ pub enum Playback {
     Gif,
     Png,
     WebP,
-    Extra(crate::extra::Kind),
+    Extra(crate::decode::Kind),
 }
 pub struct Source {
     input: Input,
@@ -95,6 +96,61 @@ pub struct View {
     pub span_width: f64,
     pub span_height: f64,
 }
+pub fn fit_in(source: (u32, u32), (w, h): (i32, i32), margin: f64) -> f64 {
+    (f64::from(w) * margin / f64::from(source.0)).min(f64::from(h) * margin / f64::from(source.1))
+}
+pub fn scaled(source: (u32, u32), zoom: f64) -> (i32, i32) {
+    (
+        (f64::from(source.0) * zoom).round().max(1.0) as i32,
+        (f64::from(source.1) * zoom).round().max(1.0) as i32,
+    )
+}
+/// The view a newly loaded image opens with.
+pub fn fit_view(source: (u32, u32), bounds: (i32, i32), scale: i32) -> View {
+    let size = scaled(source, fit_in(source, bounds, 0.9).min(1.0));
+    view(source, size, scale, None)
+}
+pub fn view(
+    source: (u32, u32),
+    size: (i32, i32),
+    scale: i32,
+    inspect: Option<(f64, (f64, f64))>,
+) -> View {
+    let (mut width, mut height) = (
+        f64::from(size.0) * f64::from(scale),
+        f64::from(size.1) * f64::from(scale),
+    );
+    if inspect.is_none() {
+        let ratio = (f64::from(source.0) / width)
+            .min(f64::from(source.1) / height)
+            .min(1.0);
+        width *= ratio;
+        height *= ratio;
+    }
+    let pixels = crate::RENDER_BYTES / 4;
+    let ratio = (pixels as f64 / (width * height)).sqrt().min(1.0);
+    width = (width * ratio).round().clamp(1.0, pixels as f64);
+    height = (height * ratio)
+        .round()
+        .clamp(1.0, (pixels / width as usize) as f64);
+    let (left, top, span_width, span_height) = match inspect {
+        Some((zoom, center)) => (
+            center.0 - f64::from(size.0) / zoom / 2.0,
+            center.1 - f64::from(size.1) / zoom / 2.0,
+            f64::from(size.0) / zoom,
+            f64::from(size.1) / zoom,
+        ),
+        None => (0.0, 0.0, f64::from(source.0), f64::from(source.1)),
+    };
+    View {
+        width: width as u32,
+        height: height as u32,
+        left,
+        top,
+        span_width,
+        span_height,
+    }
+}
 impl Source {
     pub fn load(
         input: Input,
@@ -107,14 +163,14 @@ impl Source {
             .with_guessed_format()?
             .format();
         if (format.is_none() || format == Some(ImageFormat::Avif))
-            && let Some(kind) = crate::extra::kind(&mut reader)?
+            && let Some(kind) = crate::decode::kind(&mut reader)?
         {
-            let (pixels, animated) = crate::extra::preview(input.file()?, kind, limit)?;
+            let (pixels, animated) = crate::decode::preview(input.file()?, kind, limit)?;
             let playback = animated.then_some(Playback::Extra(kind));
             return Self::pixels(input, pixels, playback, swap, format);
         }
         if matches!(format, None | Some(ImageFormat::Tiff))
-            && let Some(pixels) = crate::native::load(input.file()?, limit, cancelled)?
+            && let Some(pixels) = crate::decode::psd_raw::load(input.file()?, limit, cancelled)?
         {
             return Self::pixels(input, pixels, None, swap, format);
         }
@@ -210,7 +266,7 @@ impl Source {
             Some(ImageFormat::WebP) => {
                 let mut header = [0; 64];
                 let length = reader.read(&mut header)?;
-                let (size, animated) = match crate::image::webp_info(&header[..length]) {
+                let (size, animated) = match crate::decode::webp_info(&header[..length]) {
                     Ok(info) => info,
                     Err(_) => {
                         reader.rewind()?;
@@ -449,7 +505,9 @@ pub fn neighbors(path: &Path) -> Vec<PathBuf> {
                         e.eq_ignore_ascii_case("svg")
                             || e.eq_ignore_ascii_case("svgz")
                             || image::hooks::decoding_hook_registered(e)
-                            || crate::native::extension(&e.to_string_lossy().to_ascii_lowercase())
+                            || crate::decode::psd_raw::extension(
+                                &e.to_string_lossy().to_ascii_lowercase(),
+                            )
                     }))
         })
         .collect::<Vec<_>>();
@@ -479,7 +537,7 @@ impl Animation {
             _ => None,
         };
         let color = if format.is_some() {
-            let mut decoder = crate::image::decoder(source.input.reader()?, format, usize::MAX)?;
+            let mut decoder = crate::decode::decoder(source.input.reader()?, format, usize::MAX)?;
             crate::color::Transform::new(decoder.icc_profile()?.as_deref())?
         } else {
             None
@@ -553,7 +611,7 @@ fn frames(input: &Input, playback: Playback) -> Result<(Frames<'static>, LoopCou
             decoder.set_limits(limits(usize::MAX))?;
             split(decoder)
         }
-        Playback::Extra(kind) => crate::extra::frames(reader.into_inner(), kind)?,
+        Playback::Extra(kind) => crate::decode::frames(reader.into_inner(), kind)?,
     })
 }
 

@@ -1,6 +1,9 @@
-use crate::Result;
+use crate::{
+    Result,
+    codec_ffi::{cmsCloseProfile, cmsCreate_sRGBProfile},
+};
 use moxcms::{ColorProfile, DataColorSpace, Layout, Transform8BitExecutor, TransformOptions};
-use std::sync::Arc;
+use std::{ffi::c_void, ptr::NonNull, sync::Arc};
 
 pub struct Transform {
     transform: Arc<Transform8BitExecutor>,
@@ -101,5 +104,14 @@ pub fn convert_with(
         Ok(image::DynamicImage::ImageRgba8(rgba))
     } else {
         Ok(image)
+    }
+}
+
+handle! { pub(crate) Profile(c_void) = cmsCloseProfile; }
+impl Profile {
+    pub(crate) fn srgb() -> Result<Self> {
+        Ok(Self(
+            NonNull::new(unsafe { cmsCreate_sRGBProfile() }).ok_or("cannot create sRGB profile")?,
+        ))
     }
 }
