@@ -3,36 +3,21 @@ use std::{
     ffi::{CStr, CString, c_char, c_int, c_void},
     fs::File,
     io::Read,
-    os::fd::AsRawFd,
     ptr::{NonNull, null_mut},
     sync::Once,
 };
 
-struct Raw(NonNull<libraw_data_t>);
-impl Drop for Raw {
-    fn drop(&mut self) {
-        unsafe { libraw_close(self.0.as_ptr()) };
-    }
+handle! {
+    Raw(libraw_data_t) = libraw_close;
+    RawImage(libraw_processed_image_t) = libraw_dcraw_clear_mem;
+    Wand(MagickWand) = DestroyMagickWand;
+    pub(crate) Profile(c_void) = cmsCloseProfile;
 }
-
-struct RawImage(NonNull<libraw_processed_image_t>);
-impl Drop for RawImage {
-    fn drop(&mut self) {
-        unsafe { libraw_dcraw_clear_mem(self.0.as_ptr()) };
-    }
-}
-
-struct Wand(NonNull<MagickWand>);
-impl Drop for Wand {
-    fn drop(&mut self) {
-        unsafe { DestroyMagickWand(self.0.as_ptr()) };
-    }
-}
-
-pub(crate) struct Profile(pub(crate) NonNull<c_void>);
-impl Drop for Profile {
-    fn drop(&mut self) {
-        unsafe { cmsCloseProfile(self.0.as_ptr()) };
+impl Profile {
+    pub(crate) fn srgb() -> Result<Self> {
+        Ok(Self(
+            NonNull::new(unsafe { cmsCreate_sRGBProfile() }).ok_or("cannot create sRGB profile")?,
+        ))
     }
 }
 
@@ -57,9 +42,7 @@ unsafe extern "C" fn photoshop_progress(
 }
 
 fn srgb_profile() -> Result<Vec<u8>> {
-    let profile = Profile(
-        NonNull::new(unsafe { cmsCreate_sRGBProfile() }).ok_or("cannot create sRGB profile")?,
-    );
+    let profile = Profile::srgb()?;
     let mut size = 0;
     if unsafe { cmsSaveProfileToMem(profile.0.as_ptr(), null_mut(), &mut size) } == 0 {
         return Err("cannot size sRGB profile".into());
@@ -185,7 +168,7 @@ fn camera_raw(path: &CStr, limit: usize, cancel: &dyn Fn() -> bool) -> Result<Op
 pub fn load(mut file: File, limit: usize, cancel: &dyn Fn() -> bool) -> Result<Option<Pixels>> {
     let mut header = [0; 26];
     let length = file.read(&mut header)?;
-    let path = format!("/proc/self/fd/{}", file.as_raw_fd());
+    let path = crate::fd_path(&file);
     if length == header.len() && &header[..4] == b"8BPS" {
         let version = u16::from_be_bytes(header[4..6].try_into()?);
         if !matches!(version, 1 | 2) {

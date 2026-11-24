@@ -1,6 +1,6 @@
 use crate::{
     Result,
-    image::{Frame, Pixels, Tiff, limits},
+    image::{Frame, Pixels, Tiff, limits, oriented},
 };
 use fast_image_resize::{
     PixelType::U8x4,
@@ -15,11 +15,12 @@ use rustix::fs::{self, Mode, OFlags};
 use std::{
     fs::File,
     io::{BufReader, Read, Seek},
-    os::fd::AsRawFd,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
+
+type Rect = (u32, u32, u32, u32);
 
 pub const CACHE_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Clone)]
@@ -41,7 +42,7 @@ impl Input {
                 }
                 Ok(file)
             }
-            Self::File(file) => Ok(File::open(format!("/proc/self/fd/{}", file.as_raw_fd()))?),
+            Self::File(file) => Ok(File::open(crate::fd_path(file.as_ref()))?),
         }
     }
     fn reader(&self) -> Result<BufReader<File>> {
@@ -56,10 +57,17 @@ impl Input {
     }
 }
 
+#[derive(Clone, Copy)]
+pub enum Playback {
+    Gif,
+    Png,
+    WebP,
+    Extra(crate::extra::Kind),
+}
 pub struct Source {
     input: Input,
     pub size: (u32, u32),
-    pub animated: bool,
+    pub playback: Option<Playback>,
     orientation: Orientation,
     data: Data,
 }
@@ -102,12 +110,13 @@ impl Source {
             && let Some(kind) = crate::extra::kind(&mut reader)?
         {
             let (pixels, animated) = crate::extra::preview(input.file()?, kind, limit)?;
-            return Self::pixels(input, pixels, animated, swap, format);
+            let playback = animated.then_some(Playback::Extra(kind));
+            return Self::pixels(input, pixels, playback, swap, format);
         }
         if matches!(format, None | Some(ImageFormat::Tiff))
             && let Some(pixels) = crate::native::load(input.file()?, limit, cancelled)?
         {
-            return Self::pixels(input, pixels, false, swap, format);
+            return Self::pixels(input, pixels, None, swap, format);
         }
         let format = format.or_else(|| input.path().and_then(|p| ImageFormat::from_path(p).ok()));
         if format == Some(ImageFormat::Tiff)
@@ -129,7 +138,7 @@ impl Source {
                     .or_else(|_| {
                         Pixels::load(input.reader()?, format, input.path(), limit, cancelled)
                     })?;
-                return Self::pixels(input, pixels, false, swap, format);
+                return Self::pixels(input, pixels, None, swap, format);
             }
             let orientation = Orientation::from_exif(native.orientation().try_into()?)
                 .ok_or("invalid TIFF orientation")?;
@@ -173,15 +182,10 @@ impl Source {
                 }
             }
             levels.sort_by_key(|l| std::cmp::Reverse(u64::from(l.width) * u64::from(l.height)));
-            let size = if orientation.to_exif() >= 5 {
-                (raw_size.1, raw_size.0)
-            } else {
-                raw_size
-            };
             return Ok(Arc::new(Self {
                 input,
-                size,
-                animated: false,
+                size: oriented(raw_size, orientation),
+                playback: None,
                 orientation,
                 data: Data::Tiff {
                     levels,
@@ -200,23 +204,24 @@ impl Source {
                 let decoder =
                     image::codecs::png::PngDecoder::with_limits(&mut reader, limits(limit))?;
                 dimensions(decoder.dimensions())?;
-                decoder.is_apng()?
+                decoder.is_apng()?.then_some(Playback::Png)
             }
             Some(ImageFormat::WebP) => {
                 let mut header = [0; 64];
                 let length = reader.read(&mut header)?;
-                if let Ok((size, animated)) = crate::image::webp_info(&header[..length]) {
-                    dimensions(size)?;
-                    animated
-                } else {
-                    reader.rewind()?;
-                    let decoder = image::codecs::webp::WebPDecoder::new(&mut reader)?;
-                    dimensions(decoder.dimensions())?;
-                    decoder.has_animation()
-                }
+                let (size, animated) = match crate::image::webp_info(&header[..length]) {
+                    Ok(info) => info,
+                    Err(_) => {
+                        reader.rewind()?;
+                        let decoder = image::codecs::webp::WebPDecoder::new(&mut reader)?;
+                        (decoder.dimensions(), decoder.has_animation())
+                    }
+                };
+                dimensions(size)?;
+                animated.then_some(Playback::WebP)
             }
-            Some(ImageFormat::Gif) => true,
-            _ => false,
+            Some(ImageFormat::Gif) => Some(Playback::Gif),
+            _ => None,
         };
         reader.rewind()?;
         let pixels = Pixels::load(reader, format, input.path(), limit, cancelled)?;
@@ -225,12 +230,12 @@ impl Source {
     fn pixels(
         input: Input,
         pixels: Pixels,
-        animated: bool,
+        playback: Option<Playback>,
         swap: bool,
         format: Option<ImageFormat>,
     ) -> Result<Arc<Self>> {
         let size = pixels.original_size;
-        if !animated
+        if playback.is_none()
             && size == (pixels.width as u32, pixels.height as u32)
             && let Input::File(file) = &input
         {
@@ -242,7 +247,7 @@ impl Source {
         Ok(Arc::new(Self {
             input,
             size,
-            animated,
+            playback,
             orientation,
             data: Data::Raster { frame, format },
         }))
@@ -270,9 +275,6 @@ impl Source {
         let t = view.top.max(0.0);
         let r = (view.left + view.span_width).min(sw);
         let b = (view.top + view.span_height).min(sh);
-        if r <= l || b <= t {
-            return Pixels::new(view.width.try_into()?, view.height.try_into()?)?.freeze(false);
-        }
         let project = |value: f64, origin: f64, span: f64, extent: u32| {
             ((value - origin) / span * f64::from(extent))
                 .round()
@@ -282,7 +284,8 @@ impl Source {
         let y = project(t, view.top, view.span_height, view.height);
         let right = project(r, view.left, view.span_width, view.width);
         let bottom = project(b, view.top, view.span_height, view.height);
-        let (w, h) = (right - x, bottom - y);
+        // Empty or inverted spans project to empty destinations.
+        let (w, h) = (right.saturating_sub(x), bottom.saturating_sub(y));
         if w == 0 || h == 0 {
             return Pixels::new(view.width.try_into()?, view.height.try_into()?)?.freeze(false);
         }
@@ -300,85 +303,42 @@ impl Source {
                     && scale + 1e-8 < required
                     && let Some(format) = format
                 {
-                    return self.raster_region(view, rect, (x, y, w, h), swap, cancelled, *format);
+                    self.raster_region(rect, (w, h), swap, cancelled, *format)?
+                } else {
+                    let frame = animation.unwrap_or(frame).clone();
+                    crop(frame, (0, 0, self.size.0, self.size.1), rect)
                 }
-                let frame = animation.unwrap_or(frame);
-                let sx = f64::from(frame.width) / sw;
-                let sy = f64::from(frame.height) / sh;
-                (frame.clone(), [l * sx, t * sy, (r - l) * sx, (b - t) * sy])
             }
         };
         render_frame(frame, crop, view, (x, y, w, h))
     }
     fn raster_region(
         &self,
-        view: View,
         rect: (f64, f64, f64, f64),
-        destination: (u32, u32, u32, u32),
+        output: (u32, u32),
         swap: bool,
         cancelled: &dyn Fn() -> bool,
         format: ImageFormat,
-    ) -> Result<Arc<Frame>> {
-        let (l, t, r, b) = rect;
-        let (_, _, w, h) = destination;
-        let (left, top, right, bottom) = padded_rect(rect, (w, h), self.size);
-        let rotated = self.orientation.to_exif() >= 5;
-        let raw_size = if rotated {
-            (self.size.1, self.size.0)
+    ) -> Result<(Arc<Frame>, [f64; 4])> {
+        let even = format == ImageFormat::WebP;
+        let (padded, raw) = bounds(rect, output, self.size, self.orientation, even);
+        let raw_size = oriented(self.size, self.orientation);
+        let span = (raw.2 - raw.0, raw.3 - raw.1);
+        let target = if u64::from(span.0) * u64::from(span.1) > crate::RENDER_BYTES as u64 / 8 {
+            crate::overview::fit(span, output.0.max(output.1))
         } else {
-            self.size
+            span
         };
-        let mut raw = raw_rect((left, top, right, bottom), raw_size, self.orientation);
-        let (left, top, right, bottom) = if format == ImageFormat::WebP {
-            raw.0 &= !1;
-            raw.1 &= !1;
-            let inverse = Orientation::from_exif(match self.orientation.to_exif() {
-                6 => 8,
-                8 => 6,
-                x => x,
-            })
-            .unwrap();
-            raw_rect(raw, self.size, inverse)
-        } else {
-            (left, top, right, bottom)
-        };
-        let raw_span = (raw.2 - raw.0, raw.3 - raw.1);
-        let target =
-            if u64::from(raw_span.0) * u64::from(raw_span.1) > crate::RENDER_BYTES as u64 / 8 {
-                crate::overview::fit(raw_span, w.max(h))
-            } else {
-                raw_span
-            };
+        let reader = self.input.reader()?;
         let pixels = if format == ImageFormat::Png {
-            Pixels::png_region(self.input.reader()?, raw_size, raw, target, cancelled)?
+            Pixels::png_region(reader, raw_size, raw, target, cancelled)?
         } else {
-            Pixels::encoded_region(
-                self.input.reader()?,
-                format,
-                raw_size,
-                raw,
-                target,
-                cancelled,
-            )?
+            Pixels::encoded_region(reader, format, raw_size, raw, target, cancelled)?
         };
         if pixels.original_size != self.size || pixels.orientation != self.orientation {
             return Err("image changed while open".into());
         }
-        let (sx, sy) = (
-            f64::from(pixels.width) / f64::from(right - left),
-            f64::from(pixels.height) / f64::from(bottom - top),
-        );
-        render_frame(
-            pixels.freeze(swap)?,
-            [
-                (l - f64::from(left)) * sx,
-                (t - f64::from(top)) * sy,
-                (r - l) * sx,
-                (b - t) * sy,
-            ],
-            view,
-            destination,
-        )
+        Ok(crop(pixels.freeze(swap)?, padded, rect))
     }
     fn region(
         &self,
@@ -389,44 +349,31 @@ impl Source {
         swap: bool,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(Arc<Frame>, [f64; 4])> {
-        let rotated = self.orientation.to_exif() >= 5;
-        let logical = |level: &Level| {
-            if rotated {
-                (level.height, level.width)
-            } else {
-                (level.width, level.height)
-            }
-        };
         let mut level = &levels[0];
         for candidate in levels {
-            let (w, h) = logical(candidate);
+            let (w, h) = oriented((candidate.width, candidate.height), self.orientation);
             if (rect.2 - rect.0) * f64::from(w) / f64::from(self.size.0) >= f64::from(output.0)
                 && (rect.3 - rect.1) * f64::from(h) / f64::from(self.size.1) >= f64::from(output.1)
             {
                 level = candidate;
             }
         }
-        let (lw, lh) = logical(level);
-        let sx = f64::from(lw) / f64::from(self.size.0);
-        let sy = f64::from(lh) / f64::from(self.size.1);
-        let l = rect.0 * sx;
-        let t = rect.1 * sy;
-        let r = rect.2 * sx;
-        let b = rect.3 * sy;
-        let (left, top, right, bottom) = padded_rect((l, t, r, b), output, (lw, lh));
-        let (width, height) = (right - left, bottom - top);
-        let (w, h) = (level.width, level.height);
-        let raw = raw_rect((left, top, right, bottom), (w, h), self.orientation);
+        let size = oriented((level.width, level.height), self.orientation);
+        let sx = f64::from(size.0) / f64::from(self.size.0);
+        let sy = f64::from(size.1) / f64::from(self.size.1);
+        let scaled = (rect.0 * sx, rect.1 * sy, rect.2 * sx, rect.3 * sy);
+        let (padded, raw) = bounds(scaled, output, size, self.orientation, false);
         let mut decoder = Tiff::open(self.input.file()?)?;
         decoder.seek(level.offset)?;
-        if decoder.dimensions()? != (w, h)
+        if decoder.dimensions()? != (level.width, level.height)
             || !decoder.readable()
             || decoder.orientation() != u16::from(self.orientation.to_exif())
         {
             return Err("TIFF changed while open".into());
         }
         let full = rect == (0.0, 0.0, f64::from(self.size.0), f64::from(self.size.1));
-        let reduce = u64::from(width) * u64::from(height) > crate::RENDER_BYTES as u64 / 8;
+        let reduce = u64::from(padded.2 - padded.0) * u64::from(padded.3 - padded.1)
+            > crate::RENDER_BYTES as u64 / 8;
         let mut cache = (reduce && full).then(|| overview.lock().unwrap());
         if let Some(frame) = cache.as_deref().and_then(Option::as_ref)
             && frame.width as u32 >= output.0
@@ -438,31 +385,15 @@ impl Source {
             ));
         }
         let out = if reduce {
-            let size = if rotated {
-                (output.1, output.0)
-            } else {
-                output
-            };
-            decoder.overview(raw, size, cancelled)?
+            decoder.overview(raw, oriented(output, self.orientation), cancelled)?
         } else {
             decoder.region(raw, cancelled)?
-        }
-        .orient(self.orientation)?;
-        let sx = f64::from(out.width) / f64::from(width);
-        let sy = f64::from(out.height) / f64::from(height);
-        let frame = out.freeze(swap)?;
+        };
+        let frame = out.orient(self.orientation)?.freeze(swap)?;
         if let Some(cache) = cache.as_deref_mut() {
             *cache = Some(frame.clone());
         }
-        Ok((
-            frame,
-            [
-                (l - f64::from(left)) * sx,
-                (t - f64::from(top)) * sy,
-                (r - l) * sx,
-                (b - t) * sy,
-            ],
-        ))
+        Ok(crop(frame, padded, scaled))
     }
 }
 pub fn neighbors(path: &Path) -> Vec<PathBuf> {
@@ -494,6 +425,7 @@ pub fn neighbors(path: &Path) -> Vec<PathBuf> {
 
 pub struct Animation {
     pub source: Arc<Source>,
+    playback: Playback,
     frames: Frames<'static>,
     color: Option<crate::color::Transform>,
     remaining: Option<u32>,
@@ -502,14 +434,15 @@ pub struct Animation {
 }
 impl Animation {
     pub fn new(source: Arc<Source>) -> Result<Self> {
-        let (frames, count) = frames(&source)?;
-        let mut reader = source.input.reader()?;
-        let format = ImageReader::new(&mut reader)
-            .with_guessed_format()?
-            .format();
-        let color = if matches!(format, Some(ImageFormat::Png | ImageFormat::WebP)) {
-            reader.rewind()?;
-            let mut decoder = crate::image::decoder(reader, format, usize::MAX)?;
+        let playback = source.playback.ok_or("image is not animated")?;
+        let (frames, count) = frames(&source.input, playback)?;
+        let format = match playback {
+            Playback::Png => Some(ImageFormat::Png),
+            Playback::WebP => Some(ImageFormat::WebP),
+            _ => None,
+        };
+        let color = if format.is_some() {
+            let mut decoder = crate::image::decoder(source.input.reader()?, format, usize::MAX)?;
             crate::color::Transform::new(decoder.icc_profile()?.as_deref())?
         } else {
             None
@@ -520,6 +453,7 @@ impl Animation {
         };
         Ok(Self {
             source,
+            playback,
             frames,
             color,
             remaining,
@@ -540,7 +474,7 @@ impl Animation {
                     return Ok(None);
                 }
             }
-            self.frames = frames(&self.source)?.0;
+            self.frames = frames(&self.source.input, self.playback)?.0;
             next = self.frames.next();
         }
         let Some(frame) = next else {
@@ -560,32 +494,30 @@ impl Animation {
         )))
     }
 }
-fn frames(source: &Source) -> Result<(Frames<'static>, LoopCount)> {
-    let image = ImageReader::new(source.input.reader()?).with_guessed_format()?;
-    let format = image.format();
-    let reader = image.into_inner();
-    let (frames, count) = match format {
-        Some(ImageFormat::Gif) => {
-            let mut d = image::codecs::gif::GifDecoder::new(reader)?;
-            d.set_limits(limits(usize::MAX))?;
-            let n = d.loop_count();
-            (d.into_frames(), n)
+
+// Decoders reject replaced files whose contents no longer match the detected format.
+fn frames(input: &Input, playback: Playback) -> Result<(Frames<'static>, LoopCount)> {
+    fn split<'a>(decoder: impl AnimationDecoder<'a>) -> (Frames<'a>, LoopCount) {
+        let count = decoder.loop_count();
+        (decoder.into_frames(), count)
+    }
+    let reader = input.reader()?;
+    Ok(match playback {
+        Playback::Gif => {
+            let mut decoder = image::codecs::gif::GifDecoder::new(reader)?;
+            decoder.set_limits(limits(usize::MAX))?;
+            split(decoder)
         }
-        Some(ImageFormat::Png) => {
-            let d = image::codecs::png::PngDecoder::with_limits(reader, limits(usize::MAX))?;
-            let d = d.apng()?;
-            let n = d.loop_count();
-            (d.into_frames(), n)
+        Playback::Png => {
+            split(image::codecs::png::PngDecoder::with_limits(reader, limits(usize::MAX))?.apng()?)
         }
-        Some(ImageFormat::WebP) => {
-            let mut d = image::codecs::webp::WebPDecoder::new(reader)?;
-            d.set_limits(limits(usize::MAX))?;
-            let n = d.loop_count();
-            (d.into_frames(), n)
+        Playback::WebP => {
+            let mut decoder = image::codecs::webp::WebPDecoder::new(reader)?;
+            decoder.set_limits(limits(usize::MAX))?;
+            split(decoder)
         }
-        _ => return crate::extra::frames(source.input.file()?),
-    };
-    Ok((frames, count))
+        Playback::Extra(kind) => crate::extra::frames(reader.into_inner(), kind)?,
+    })
 }
 
 fn render_frame(
@@ -630,25 +562,56 @@ fn render_frame(
     out.freeze(false)
 }
 
-fn padded_rect(
+/// Projects `rect` into a frame decoded from the integer `bounds` of the same canvas.
+fn crop(
+    frame: Arc<Frame>,
+    (left, top, right, bottom): Rect,
     (l, t, r, b): (f64, f64, f64, f64),
-    (w, h): (u32, u32),
-    bounds: (u32, u32),
-) -> (u32, u32, u32, u32) {
-    let halo = (3.0 * ((r - l) / f64::from(w)).max((b - t) / f64::from(h))).ceil() + 1.0;
-    (
-        (l - halo).floor().max(0.0) as u32,
-        (t - halo).floor().max(0.0) as u32,
-        (r + halo).ceil().min(f64::from(bounds.0)) as u32,
-        (b + halo).ceil().min(f64::from(bounds.1)) as u32,
-    )
+) -> (Arc<Frame>, [f64; 4]) {
+    let sx = f64::from(frame.width) / f64::from(right - left);
+    let sy = f64::from(frame.height) / f64::from(bottom - top);
+    let crop = [
+        (l - f64::from(left)) * sx,
+        (t - f64::from(top)) * sy,
+        (r - l) * sx,
+        (b - t) * sy,
+    ];
+    (frame, crop)
 }
 
-fn raw_rect(
-    rect: (u32, u32, u32, u32),
+/// Pads `rect` for the resampling filter within an oriented canvas of `size`.
+/// Returns the padded canvas bounds and the matching raw decoder bounds.
+fn bounds(
+    (l, t, r, b): (f64, f64, f64, f64),
+    (w, h): (u32, u32),
     size: (u32, u32),
     orientation: Orientation,
-) -> (u32, u32, u32, u32) {
+    even: bool,
+) -> (Rect, Rect) {
+    let halo = (3.0 * ((r - l) / f64::from(w)).max((b - t) / f64::from(h))).ceil() + 1.0;
+    let padded = (
+        (l - halo).floor().max(0.0) as u32,
+        (t - halo).floor().max(0.0) as u32,
+        (r + halo).ceil().min(f64::from(size.0)) as u32,
+        (b + halo).ceil().min(f64::from(size.1)) as u32,
+    );
+    let mut raw = raw_rect(padded, oriented(size, orientation), orientation);
+    if !even {
+        return (padded, raw);
+    }
+    // WebP crops start at even raw coordinates.
+    raw.0 &= !1;
+    raw.1 &= !1;
+    let inverse = Orientation::from_exif(match orientation.to_exif() {
+        6 => 8,
+        8 => 6,
+        x => x,
+    })
+    .unwrap();
+    (raw_rect(raw, size, inverse), raw)
+}
+
+fn raw_rect(rect: Rect, size: (u32, u32), orientation: Orientation) -> Rect {
     let (left, top, right, bottom) = rect;
     let (w, h) = size;
     match orientation.to_exif() {

@@ -91,7 +91,11 @@ impl Worker {
             .name("perch-images".into())
             .spawn(move || {
                 let mut animations = HashMap::<u64, Animation>::new();
-                let mut cache: Option<(u64, PathBuf, Arc<Source>)> = None;
+                let mut cache: Option<(u64, Arc<Source>)> = None;
+                // Preloaded sources always have a path.
+                let cached = |input: &Input, cache: &Option<(u64, Arc<Source>)>| {
+                    cache.as_ref().is_some_and(|c| c.1.path() == input.path())
+                };
                 loop {
                     let (job, was_full) = {
                         let (lock, ready) = &*work;
@@ -122,12 +126,9 @@ impl Worker {
                         }
                         continue;
                     }
-                    let load = |input: Input, cache: &mut Option<(u64, PathBuf, Arc<Source>)>| {
-                        if cache
-                            .as_ref()
-                            .is_some_and(|c| input.path() == Some(c.1.as_path()))
-                        {
-                            Ok(cache.take().unwrap().2)
+                    let load = |input: Input, cache: &mut Option<(u64, Arc<Source>)>| {
+                        if cached(&input, cache) {
+                            Ok(cache.take().unwrap().1)
                         } else {
                             Source::load(input, swap, usize::MAX, &|| !job.live())
                         }
@@ -164,10 +165,7 @@ impl Worker {
                                 Ok(Some(Output::Loaded(load(input.clone(), &mut cache)?)))
                             }
                             Action::Preload(input) => {
-                                if cache
-                                    .as_ref()
-                                    .is_some_and(|c| input.path() == Some(c.1.as_path()))
-                                {
+                                if cached(input, &cache) {
                                     return Ok(None);
                                 }
                                 let source =
@@ -176,9 +174,9 @@ impl Worker {
                                     })?;
                                 if job.live()
                                     && source.bytes() <= CACHE_BYTES
-                                    && let Some(path) = source.path()
+                                    && source.path().is_some()
                                 {
-                                    cache = Some((job.id, path.to_path_buf(), source));
+                                    cache = Some((job.id, source));
                                 }
                                 Ok(None)
                             }

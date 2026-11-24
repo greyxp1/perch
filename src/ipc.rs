@@ -3,7 +3,7 @@ use rustix::{
     fs::{
         self, MemfdFlags, Mode, OFlags, SealFlags, fcntl_add_seals, fcntl_get_seals, memfd_create,
     },
-    io::Errno,
+    io::{Errno, retry_on_intr as retry},
     net::{
         self, AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
         SendAncillaryBuffer, SendAncillaryMessage, SendFlags, SocketAddrUnix, SocketFlags,
@@ -18,7 +18,7 @@ use std::{
     io::{self, BufRead, BufReader, BufWriter, IoSlice, IoSliceMut, Read, Write},
     mem::MaybeUninit,
     os::{
-        fd::{AsFd, AsRawFd, OwnedFd},
+        fd::{AsFd, OwnedFd},
         unix::ffi::{OsStrExt, OsStringExt},
     },
     path::PathBuf,
@@ -27,6 +27,8 @@ use std::{
 
 const MAX_PATHS: usize = 4096;
 const MAX_PATH: usize = 4096;
+const PATHS: &[u8; 5] = b"PER2P";
+const STDIN: &[u8; 5] = b"PER2S";
 const IMMUTABLE: SealFlags = SealFlags::GROW
     .union(SealFlags::SHRINK)
     .union(SealFlags::WRITE);
@@ -63,22 +65,21 @@ pub fn accept(listener: &OwnedFd) -> rustix::io::Result<OwnedFd> {
     Ok(fd)
 }
 
-fn retry<T>(mut operation: impl FnMut() -> rustix::io::Result<T>) -> rustix::io::Result<T> {
-    loop {
-        match operation() {
-            Err(Errno::INTR) => continue,
-            result => return result,
-        }
-    }
-}
-
-pub fn reply(fd: &OwnedFd, success: bool) -> rustix::io::Result<()> {
-    let bytes = [u8::from(!success)];
-    if retry(|| net::send(fd, &bytes, SendFlags::NOSIGNAL))? == bytes.len() {
+fn send(fd: &OwnedFd, bytes: &[u8], control: &mut SendAncillaryBuffer) -> rustix::io::Result<()> {
+    let slice = [IoSlice::new(bytes)];
+    if retry(|| net::sendmsg(fd, &slice, control, SendFlags::NOSIGNAL))? == bytes.len() {
         Ok(())
     } else {
         Err(Errno::IO)
     }
+}
+
+pub fn reply(fd: &OwnedFd, success: bool) -> rustix::io::Result<()> {
+    send(
+        fd,
+        &[u8::from(!success)],
+        &mut SendAncillaryBuffer::default(),
+    )
 }
 
 pub enum Request {
@@ -98,7 +99,7 @@ impl Request {
         if !fcntl_get_seals(file)?.contains(IMMUTABLE) {
             return Err("path list is not sealed".into());
         }
-        let mut reader = BufReader::new(File::open(format!("/proc/self/fd/{}", file.as_raw_fd()))?);
+        let mut reader = BufReader::new(File::open(crate::fd_path(file))?);
         let mut inputs = Vec::new();
         loop {
             let mut bytes = Vec::new();
@@ -155,8 +156,8 @@ pub fn receive(fd: &OwnedFd) -> Result<Option<Request>> {
         return Err("invalid request descriptor".into());
     }
     match &buffer {
-        b"PER2P" => Ok(Some(Request::Paths(file))),
-        b"PER2S" => Ok(Some(Request::Stdin(Arc::new(file)))),
+        PATHS => Ok(Some(Request::Paths(file))),
+        STDIN => Ok(Some(Request::Stdin(Arc::new(file)))),
         _ => Err("invalid request header".into()),
     }
 }
@@ -177,7 +178,7 @@ pub fn run_client(args: &[OsString]) -> Result<()> {
         if io::copy(&mut io::stdin().lock(), &mut file)? == 0 {
             return Err("cannot open stdin: empty stream".into());
         }
-        (b"PER2S", file)
+        (STDIN, file)
     } else {
         let fd = memfd_create(
             c"perch-paths",
@@ -197,23 +198,13 @@ pub fn run_client(args: &[OsString]) -> Result<()> {
         }
         let file = writer.into_inner()?;
         fcntl_add_seals(&file, IMMUTABLE)?;
-        (b"PER2P", file)
+        (PATHS, file)
     };
     let fds = [file.as_fd()];
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
     let mut control = SendAncillaryBuffer::new(&mut space);
     assert!(control.push(SendAncillaryMessage::ScmRights(&fds)));
-    if retry(|| {
-        net::sendmsg(
-            &fd,
-            &[IoSlice::new(header)],
-            &mut control,
-            SendFlags::NOSIGNAL,
-        )
-    })? != header.len()
-    {
-        return Err("cannot send request".into());
-    }
+    send(&fd, header, &mut control).map_err(|error| format!("cannot send request: {error}"))?;
     let mut response = [1];
     let (_, size) = retry(|| net::recv(&fd, &mut response[..], RecvFlags::TRUNC))?;
     if size == 1 && response[0] == 0 {

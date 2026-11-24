@@ -131,13 +131,11 @@ impl Pin {
         self.toplevel.set_title(format!("Perch: {name}{state}"));
     }
     fn fit(&self) -> f64 {
-        (f64::from(self.bounds.0) * 0.9 / f64::from(self.source.size.0))
-            .min(f64::from(self.bounds.1) * 0.9 / f64::from(self.source.size.1))
-            .min(1.0)
+        self.fit_in(self.bounds, 0.9).min(1.0)
     }
-    fn fit_in(&self, size: (i32, i32)) -> f64 {
-        (f64::from(size.0) / f64::from(self.source.size.0))
-            .min(f64::from(size.1) / f64::from(self.source.size.1))
+    fn fit_in(&self, (w, h): (i32, i32), margin: f64) -> f64 {
+        (f64::from(w) * margin / f64::from(self.source.size.0))
+            .min(f64::from(h) * margin / f64::from(self.source.size.1))
     }
     fn center_image(&mut self) {
         self.center = (
@@ -219,15 +217,13 @@ impl Pin {
         }
     }
     fn zoom(&mut self, value: f64) {
-        let minimum = if self.inspect {
-            self.fit_in(self.size)
+        let (minimum, maximum) = if self.inspect {
+            (self.fit_in(self.size, 1.0), 8.0)
         } else {
-            0.05_f64.min(self.fit())
-        };
-        let maximum = if self.inspect {
-            8.0
-        } else {
-            self.fit_in(self.bounds).min(8.0)
+            (
+                0.05_f64.min(self.fit()),
+                self.fit_in(self.bounds, 1.0).min(8.0),
+            )
         };
         let zoom = (self.zoom * 1.1_f64.powf(-value / 15.0)).clamp(minimum, maximum.max(minimum));
         if zoom == self.zoom {
@@ -265,7 +261,8 @@ impl Drop for Pin {
 enum PendingState {
     Queued(Arc<ipc::Request>),
     Decoding,
-    Rendering(Vec<u64>),
+    // Member pins and how many still lack their first buffer.
+    Rendering(Vec<u64>, usize),
 }
 struct Pending {
     fd: OwnedFd,
@@ -391,7 +388,7 @@ impl App {
     fn fail_request(&mut self, id: u64) {
         if let Some(pending) = self.pending.remove(&id) {
             let _ = ipc::reply(&pending.fd, false);
-            if let PendingState::Rendering(ids) = &pending.state {
+            if let PendingState::Rendering(ids, _) = &pending.state {
                 for &pin in ids {
                     self.remove_pin(pin);
                 }
@@ -462,7 +459,7 @@ impl App {
             return;
         }
         match key {
-            keysyms::KEY_space if pin.source.animated => {
+            keysyms::KEY_space if pin.source.playback.is_some() => {
                 pin.playing = !pin.playing;
                 pin.next_frame = Instant::now();
                 pin.invalidate();
@@ -471,7 +468,7 @@ impl App {
             keysyms::KEY_Tab => {
                 pin.inspect = !pin.inspect;
                 if !pin.inspect {
-                    pin.zoom = pin.fit_in(pin.size);
+                    pin.zoom = pin.fit_in(pin.size, 1.0);
                 }
                 pin.center_image();
                 pin.invalidate();
@@ -485,20 +482,17 @@ impl App {
                     pin.inspect = true;
                     pin.title();
                 }
+                pin.zoom = if key == keysyms::KEY_End {
+                    1.0
+                } else if pin.inspect {
+                    pin.fit_in(pin.size, 1.0)
+                } else {
+                    pin.fit()
+                };
                 if pin.inspect {
-                    pin.zoom = if key == keysyms::KEY_End {
-                        1.0
-                    } else {
-                        pin.fit_in(pin.size)
-                    };
                     pin.center_image();
                     pin.clamp_center();
                 } else {
-                    pin.zoom = if key == keysyms::KEY_End {
-                        1.0
-                    } else {
-                        pin.fit()
-                    };
                     pin.size_to_zoom();
                     pin.constraints();
                 }
@@ -518,11 +512,13 @@ impl App {
             if self.pending.contains_key(&id) {
                 match result {
                     Ok(Output::Opened { sources, paths }) => {
-                        let ids = sources
+                        let ids: Vec<_> = sources
                             .into_iter()
                             .map(|source| self.create_pin(source, paths.clone(), id, qh))
                             .collect();
-                        self.pending.get_mut(&id).unwrap().state = PendingState::Rendering(ids);
+                        let count = ids.len();
+                        self.pending.get_mut(&id).unwrap().state =
+                            PendingState::Rendering(ids, count);
                     }
                     Err(error) => {
                         eprintln!("perch: {error}");
@@ -556,9 +552,8 @@ impl App {
                     stepped,
                 }) => {
                     let buffer = frame.buffer(self.shm.as_ref().unwrap(), self.abgr, qh);
-                    if let Some(old) = pin.buffer.replace(buffer.clone()) {
-                        old.destroy();
-                    }
+                    let old = pin.buffer.replace(buffer.clone());
+                    let first = old.inspect(wl_buffer::WlBuffer::destroy).is_none();
                     pin.viewport.set_destination(pin.size.0, pin.size.1);
                     pin.surface.attach(Some(&buffer), 0, 0);
                     pin.surface.damage_buffer(0, 0, frame.width, frame.height);
@@ -575,19 +570,17 @@ impl App {
                         pin.arm_callback(id, qh);
                     }
                     pin.surface.commit();
-                    if let Some(request) = pin.request {
-                        let ready =
-                            self.pending.get(&request).is_some_and(|pending| {
-                                match &pending.state {
-                                    PendingState::Rendering(ids) => ids.iter().all(|id| {
-                                        self.pins.get(id).is_some_and(|pin| pin.buffer.is_some())
-                                    }),
-                                    _ => false,
-                                }
-                            });
-                        if ready {
+                    if first
+                        && let Some(request) = pin.request
+                        && let Some(Pending {
+                            state: PendingState::Rendering(_, remaining),
+                            ..
+                        }) = self.pending.get_mut(&request)
+                    {
+                        *remaining -= 1;
+                        if *remaining == 0 {
                             let pending = self.pending.remove(&request).unwrap();
-                            if let PendingState::Rendering(ids) = &pending.state {
+                            if let PendingState::Rendering(ids, _) = &pending.state {
                                 for id in ids {
                                     if let Some(pin) = self.pins.get_mut(id) {
                                         pin.request = None;
@@ -614,15 +607,12 @@ impl App {
     }
     fn schedule(&mut self, qh: &QueueHandle<Self>) -> Option<Duration> {
         let now = Instant::now();
-        let mut wait = None;
-        let mut repeats = Vec::new();
-        for (&name, seat) in &self.seats {
-            if let (Some((_, key, deadline)), Some(id)) = (seat.repeating, seat.key_pin)
-                && deadline <= now
-            {
-                repeats.push((name, id, key));
-            }
-        }
+        let repeats: Vec<_> = (self.seats.iter())
+            .filter_map(|(&name, seat)| {
+                let (_, key, deadline) = seat.repeating?;
+                (deadline <= now).then_some((name, seat.key_pin?, key))
+            })
+            .collect();
         for (name, id, key) in repeats {
             if self.pins.get(&id).is_some_and(|pin| {
                 pin.work == Work::Idle && pin.request.is_none() && pin.paths.len() > 1
@@ -631,15 +621,6 @@ impl App {
                 seat.repeating.as_mut().unwrap().2 =
                     now + Duration::from_secs_f64(1.0 / f64::from(seat.repeat_rate));
                 self.key(id, key);
-            }
-        }
-        // Leave overdue repeats pending while the worker finishes the current frame.
-        for seat in self.seats.values() {
-            if let Some((_, _, deadline)) = seat.repeating
-                && deadline > now
-            {
-                let delay = deadline - now;
-                wait = Some(wait.map_or(delay, |old: Duration| old.min(delay)));
             }
         }
         let worker = self.worker.as_ref().unwrap();
@@ -684,28 +665,57 @@ impl App {
                     pin.work = Work::Rendering;
                 }
             }
-            if pin.playing
-                && pin.visible
-                && pin.work != Work::Rendering
-                && pin.callback.is_none()
-                && pin.next_frame > now
-            {
-                let delay = pin.next_frame - now;
-                wait = Some(wait.map_or(delay, |old: Duration| old.min(delay)));
-            }
         }
-        wait
+        // Leave overdue repeats and frames pending while the worker finishes the current frame.
+        let repeats = self
+            .seats
+            .values()
+            .filter_map(|seat| Some(seat.repeating?.2));
+        let frames = (self.pins.values())
+            .filter(|pin| {
+                pin.configured
+                    && !matches!(pin.work, Work::Loading | Work::Rendering)
+                    && pin.playing
+                    && pin.visible
+                    && pin.callback.is_none()
+            })
+            .map(|pin| pin.next_frame);
+        repeats
+            .chain(frames)
+            .filter(|&deadline| deadline > now)
+            .min()
+            .map(|deadline| deadline - now)
     }
 }
-impl Dispatch<wl_registry::WlRegistry, ()> for App {
-    fn event(
-        state: &mut Self,
-        registry: &wl_registry::WlRegistry,
-        event: wl_registry::Event,
-        _: &(),
-        _: &Connection,
-        qh: &QueueHandle<Self>,
-    ) {
+
+/// Implements `Dispatch` for `App` with a handler taking the state, proxy, event, user data and queue.
+macro_rules! dispatch {
+    ($proxy:ty, $data:ty, $handler:expr) => {
+        impl Dispatch<$proxy, $data> for App {
+            fn event(
+                state: &mut Self,
+                proxy: &$proxy,
+                event: <$proxy as Proxy>::Event,
+                data: &$data,
+                _: &Connection,
+                qh: &QueueHandle<Self>,
+            ) {
+                let handler: fn(
+                    &mut Self,
+                    &$proxy,
+                    <$proxy as Proxy>::Event,
+                    &$data,
+                    &QueueHandle<Self>,
+                ) = $handler;
+                handler(state, proxy, event, data, qh);
+            }
+        }
+    };
+}
+dispatch!(
+    wl_registry::WlRegistry,
+    (),
+    |state, registry, event, _, qh| {
         match event {
             wl_registry::Event::Global {
                 name,
@@ -754,50 +764,27 @@ impl Dispatch<wl_registry::WlRegistry, ()> for App {
             _ => {}
         }
     }
-}
+);
 
-impl Dispatch<wl_shm::WlShm, ()> for App {
-    fn event(
-        state: &mut Self,
-        _: &wl_shm::WlShm,
-        event: wl_shm::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let wl_shm::Event::Format {
-            format: WEnum::Value(wl_shm::Format::Abgr8888),
-        } = event
-        {
-            state.abgr = true;
-        }
+dispatch!(wl_shm::WlShm, (), |state, _, event, _, _| {
+    if let wl_shm::Event::Format {
+        format: WEnum::Value(wl_shm::Format::Abgr8888),
+    } = event
+    {
+        state.abgr = true;
     }
-}
+});
 
-impl Dispatch<xdg_wm_base::XdgWmBase, ()> for App {
-    fn event(
-        _: &mut Self,
-        wm: &xdg_wm_base::XdgWmBase,
-        event: xdg_wm_base::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let xdg_wm_base::Event::Ping { serial } = event {
-            wm.pong(serial);
-        }
+dispatch!(xdg_wm_base::XdgWmBase, (), |_, wm, event, _, _| {
+    if let xdg_wm_base::Event::Ping { serial } = event {
+        wm.pong(serial);
     }
-}
+});
 
-impl Dispatch<xdg_surface::XdgSurface, u64> for App {
-    fn event(
-        state: &mut Self,
-        surface: &xdg_surface::XdgSurface,
-        event: xdg_surface::Event,
-        id: &u64,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
+dispatch!(
+    xdg_surface::XdgSurface,
+    u64,
+    |state, surface, event, id, _| {
         if let xdg_surface::Event::Configure { serial } = event {
             surface.ack_configure(serial);
             if let Some(pin) = state.pins.get_mut(id).filter(|pin| !pin.configured) {
@@ -807,292 +794,238 @@ impl Dispatch<xdg_surface::XdgSurface, u64> for App {
             }
         }
     }
-}
+);
 
-impl Dispatch<xdg_toplevel::XdgToplevel, u64> for App {
-    fn event(
-        state: &mut Self,
-        _: &xdg_toplevel::XdgToplevel,
-        event: xdg_toplevel::Event,
-        id: &u64,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        match event {
-            xdg_toplevel::Event::Close => state.close_pin(*id),
-            xdg_toplevel::Event::ConfigureBounds { width, height } if width > 0 && height > 0 => {
-                if let Some(pin) = state.pins.get_mut(id).filter(|pin| !pin.configured) {
-                    pin.bounds = (width, height);
-                    pin.initial_size();
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-impl Dispatch<wl_seat::WlSeat, u32> for App {
-    fn event(
-        state: &mut Self,
-        _: &wl_seat::WlSeat,
-        event: wl_seat::Event,
-        name: &u32,
-        _: &Connection,
-        qh: &QueueHandle<Self>,
-    ) {
-        let Some(seat) = state.seats.get_mut(name) else {
-            return;
-        };
-        if let wl_seat::Event::Capabilities {
-            capabilities: WEnum::Value(capabilities),
-        } = event
-        {
-            if capabilities.contains(wl_seat::Capability::Pointer) {
-                if seat.pointer.is_none() {
-                    seat.pointer = Some(seat.wl.get_pointer(qh, *name));
-                }
-            } else {
-                if let Some(pointer) = seat.pointer.take() {
-                    pointer.release();
-                }
-                seat.pin = None;
-                seat.dragging = false;
-            }
-            if capabilities.contains(wl_seat::Capability::Keyboard) {
-                if seat.keyboard.is_none() {
-                    seat.keyboard = Some(seat.wl.get_keyboard(qh, *name));
-                }
-            } else {
-                if let Some(keyboard) = seat.keyboard.take() {
-                    keyboard.release();
-                }
-                seat.key_pin = None;
-                seat.keys = None;
-                seat.repeating = None;
+dispatch!(xdg_toplevel::XdgToplevel, u64, |state, _, event, id, _| {
+    match event {
+        xdg_toplevel::Event::Close => state.close_pin(*id),
+        xdg_toplevel::Event::ConfigureBounds { width, height } if width > 0 && height > 0 => {
+            if let Some(pin) = state.pins.get_mut(id).filter(|pin| !pin.configured) {
+                pin.bounds = (width, height);
+                pin.initial_size();
             }
         }
+        _ => {}
     }
-}
+});
 
-impl Dispatch<wl_pointer::WlPointer, u32> for App {
-    fn event(
-        state: &mut Self,
-        _: &wl_pointer::WlPointer,
-        event: wl_pointer::Event,
-        name: &u32,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        let Some(seat) = state.seats.get_mut(name) else {
-            return;
-        };
-        match event {
-            wl_pointer::Event::Enter {
-                surface,
-                surface_x,
-                surface_y,
-                ..
-            } => {
-                seat.pin = surface.data::<u64>().copied();
-                seat.position = (surface_x, surface_y);
+dispatch!(wl_seat::WlSeat, u32, |state, _, event, name, qh| {
+    let Some(seat) = state.seats.get_mut(name) else {
+        return;
+    };
+    if let wl_seat::Event::Capabilities {
+        capabilities: WEnum::Value(capabilities),
+    } = event
+    {
+        if capabilities.contains(wl_seat::Capability::Pointer) {
+            if seat.pointer.is_none() {
+                seat.pointer = Some(seat.wl.get_pointer(qh, *name));
             }
-            wl_pointer::Event::Leave { .. } => {
-                seat.pin = None;
-                seat.dragging = false;
+        } else {
+            if let Some(pointer) = seat.pointer.take() {
+                pointer.release();
             }
-            wl_pointer::Event::Motion {
-                surface_x,
-                surface_y,
-                ..
-            } => {
-                let old = seat.position;
-                seat.position = (surface_x, surface_y);
-                if seat.dragging
-                    && let Some(pin) = seat.pin.and_then(|id| state.pins.get_mut(&id))
-                {
-                    pin.center.0 -= (surface_x - old.0) / pin.zoom;
-                    pin.center.1 -= (surface_y - old.1) / pin.zoom;
-                    pin.clamp_center();
-                    pin.invalidate();
-                }
+            seat.pin = None;
+            seat.dragging = false;
+        }
+        if capabilities.contains(wl_seat::Capability::Keyboard) {
+            if seat.keyboard.is_none() {
+                seat.keyboard = Some(seat.wl.get_keyboard(qh, *name));
             }
-            wl_pointer::Event::Button {
-                serial,
-                button,
-                state: WEnum::Value(pressed),
-                ..
-            } => {
-                if let Some(id) = seat.pin {
-                    if button == 0x110 {
-                        if pressed == wl_pointer::ButtonState::Pressed {
-                            if let Some(pin) = state.pins.get(&id) {
-                                if pin.inspect {
-                                    seat.dragging = true;
-                                } else {
-                                    pin.toplevel._move(&seat.wl, serial);
-                                }
+        } else {
+            if let Some(keyboard) = seat.keyboard.take() {
+                keyboard.release();
+            }
+            seat.key_pin = None;
+            seat.keys = None;
+            seat.repeating = None;
+        }
+    }
+});
+
+dispatch!(wl_pointer::WlPointer, u32, |state, _, event, name, _| {
+    let Some(seat) = state.seats.get_mut(name) else {
+        return;
+    };
+    match event {
+        wl_pointer::Event::Enter {
+            surface,
+            surface_x,
+            surface_y,
+            ..
+        } => {
+            seat.pin = surface.data::<u64>().copied();
+            seat.position = (surface_x, surface_y);
+        }
+        wl_pointer::Event::Leave { .. } => {
+            seat.pin = None;
+            seat.dragging = false;
+        }
+        wl_pointer::Event::Motion {
+            surface_x,
+            surface_y,
+            ..
+        } => {
+            let old = seat.position;
+            seat.position = (surface_x, surface_y);
+            if seat.dragging
+                && let Some(pin) = seat.pin.and_then(|id| state.pins.get_mut(&id))
+            {
+                pin.center.0 -= (surface_x - old.0) / pin.zoom;
+                pin.center.1 -= (surface_y - old.1) / pin.zoom;
+                pin.clamp_center();
+                pin.invalidate();
+            }
+        }
+        wl_pointer::Event::Button {
+            serial,
+            button,
+            state: WEnum::Value(pressed),
+            ..
+        } => {
+            if let Some(id) = seat.pin {
+                if button == 0x110 {
+                    if pressed == wl_pointer::ButtonState::Pressed {
+                        if let Some(pin) = state.pins.get(&id) {
+                            if pin.inspect {
+                                seat.dragging = true;
+                            } else {
+                                pin.toplevel._move(&seat.wl, serial);
                             }
-                        } else {
-                            seat.dragging = false;
                         }
-                    } else if button == 0x111 && pressed == wl_pointer::ButtonState::Pressed {
-                        state.close_pin(id);
+                    } else {
+                        seat.dragging = false;
                     }
+                } else if button == 0x111 && pressed == wl_pointer::ButtonState::Pressed {
+                    state.close_pin(id);
                 }
             }
-            wl_pointer::Event::Axis {
-                axis: WEnum::Value(wl_pointer::Axis::VerticalScroll),
-                value,
-                ..
-            } => {
-                if let Some(pin) = seat.pin.and_then(|id| state.pins.get_mut(&id)) {
-                    pin.zoom(value);
-                }
-            }
-            _ => {}
         }
+        wl_pointer::Event::Axis {
+            axis: WEnum::Value(wl_pointer::Axis::VerticalScroll),
+            value,
+            ..
+        } => {
+            if let Some(pin) = seat.pin.and_then(|id| state.pins.get_mut(&id)) {
+                pin.zoom(value);
+            }
+        }
+        _ => {}
     }
-}
-impl Dispatch<wl_keyboard::WlKeyboard, u32> for App {
-    fn event(
-        state: &mut Self,
-        _: &wl_keyboard::WlKeyboard,
-        event: wl_keyboard::Event,
-        name: &u32,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        let Some(seat) = state.seats.get_mut(name) else {
-            return;
-        };
-        match event {
-            wl_keyboard::Event::Keymap {
-                format: WEnum::Value(wl_keyboard::KeymapFormat::XkbV1),
-                fd,
-                size,
-            } => {
-                seat.keys = None;
-                seat.repeating = None;
-                let mut bytes = vec![0; (size as usize).min(16 * 1024 * 1024)];
-                if size <= 16 * 1024 * 1024
-                    && File::from(fd).read_exact_at(&mut bytes, 0).is_ok()
-                    && let Ok(text) = String::from_utf8(bytes)
-                {
-                    let context = xkb::Context::new(xkb::CONTEXT_NO_DEFAULT_INCLUDES);
-                    if let Some(keymap) = xkb::Keymap::new_from_string(
-                        &context,
-                        text.trim_end_matches('\0').to_owned(),
-                        xkb::KEYMAP_FORMAT_TEXT_V1,
-                        xkb::KEYMAP_COMPILE_NO_FLAGS,
-                    ) {
-                        seat.keys = Some(xkb::State::new(&keymap));
-                    }
+});
+dispatch!(wl_keyboard::WlKeyboard, u32, |state, _, event, name, _| {
+    let Some(seat) = state.seats.get_mut(name) else {
+        return;
+    };
+    match event {
+        wl_keyboard::Event::Keymap {
+            format: WEnum::Value(wl_keyboard::KeymapFormat::XkbV1),
+            fd,
+            size,
+        } => {
+            seat.keys = None;
+            seat.repeating = None;
+            let mut bytes = vec![0; (size as usize).min(16 * 1024 * 1024)];
+            if size <= 16 * 1024 * 1024
+                && File::from(fd).read_exact_at(&mut bytes, 0).is_ok()
+                && let Ok(text) = String::from_utf8(bytes)
+            {
+                let context = xkb::Context::new(xkb::CONTEXT_NO_DEFAULT_INCLUDES);
+                if let Some(keymap) = xkb::Keymap::new_from_string(
+                    &context,
+                    text.trim_end_matches('\0').to_owned(),
+                    xkb::KEYMAP_FORMAT_TEXT_V1,
+                    xkb::KEYMAP_COMPILE_NO_FLAGS,
+                ) {
+                    seat.keys = Some(xkb::State::new(&keymap));
                 }
             }
-            wl_keyboard::Event::RepeatInfo { rate, delay } => {
-                seat.repeat_rate = rate.max(0);
-                seat.repeat_delay = delay.max(0);
-                if rate <= 0 {
+        }
+        wl_keyboard::Event::RepeatInfo { rate, delay } => {
+            seat.repeat_rate = rate.max(0);
+            seat.repeat_delay = delay.max(0);
+            if rate <= 0 {
+                seat.repeating = None;
+            }
+        }
+        wl_keyboard::Event::Modifiers {
+            mods_depressed,
+            mods_latched,
+            mods_locked,
+            group,
+            ..
+        } => {
+            if let Some(keys) = &mut seat.keys {
+                keys.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
+            }
+        }
+        wl_keyboard::Event::Enter { surface, .. } => {
+            seat.repeating = None;
+            seat.key_pin = surface.data::<u64>().copied();
+        }
+        wl_keyboard::Event::Leave { .. } => {
+            seat.key_pin = None;
+            seat.repeating = None;
+        }
+        wl_keyboard::Event::Key {
+            key,
+            state: WEnum::Value(pressed),
+            ..
+        } => {
+            if pressed == wl_keyboard::KeyState::Released {
+                if seat.repeating.is_some_and(|(held, _, _)| held == key) {
                     seat.repeating = None;
                 }
-            }
-            wl_keyboard::Event::Modifiers {
-                mods_depressed,
-                mods_latched,
-                mods_locked,
-                group,
-                ..
-            } => {
-                if let Some(keys) = &mut seat.keys {
-                    keys.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
-                }
-            }
-            wl_keyboard::Event::Enter { surface, .. } => {
-                seat.repeating = None;
-                seat.key_pin = surface.data::<u64>().copied();
-            }
-            wl_keyboard::Event::Leave { .. } => {
-                seat.key_pin = None;
-                seat.repeating = None;
-            }
-            wl_keyboard::Event::Key {
-                key,
-                state: WEnum::Value(pressed),
-                ..
-            } => {
-                if pressed == wl_keyboard::KeyState::Released {
-                    if seat.repeating.is_some_and(|(held, _, _)| held == key) {
+            } else if let Some(id) = seat.key_pin {
+                let symbol = seat.keys.as_ref().and_then(|keys| {
+                    key.checked_add(8).map(|code| {
+                        (
+                            keys.key_get_one_sym(code.into()).raw(),
+                            keys.get_keymap().key_repeats(code.into()),
+                        )
+                    })
+                });
+                if let Some((symbol, repeats)) = symbol {
+                    if repeats {
                         seat.repeating = None;
                     }
-                } else if let Some(id) = seat.key_pin {
-                    let symbol = seat.keys.as_ref().and_then(|keys| {
-                        key.checked_add(8).map(|code| {
-                            (
-                                keys.key_get_one_sym(code.into()).raw(),
-                                keys.get_keymap().key_repeats(code.into()),
-                            )
-                        })
-                    });
-                    if let Some((symbol, repeats)) = symbol {
-                        if repeats {
-                            seat.repeating = None;
-                        }
-                        if matches!(symbol, keysyms::KEY_Left | keysyms::KEY_Right)
-                            && repeats
-                            && seat.repeat_rate > 0
-                        {
-                            seat.repeating = Some((
-                                key,
-                                symbol,
-                                Instant::now() + Duration::from_millis(seat.repeat_delay as u64),
-                            ));
-                        }
-                        state.key(id, symbol);
+                    if matches!(symbol, keysyms::KEY_Left | keysyms::KEY_Right)
+                        && repeats
+                        && seat.repeat_rate > 0
+                    {
+                        seat.repeating = Some((
+                            key,
+                            symbol,
+                            Instant::now() + Duration::from_millis(seat.repeat_delay as u64),
+                        ));
                     }
+                    state.key(id, symbol);
                 }
             }
-            _ => {}
         }
+        _ => {}
     }
-}
-impl Dispatch<wl_callback::WlCallback, u64> for App {
-    fn event(
-        state: &mut Self,
-        callback: &wl_callback::WlCallback,
-        _: wl_callback::Event,
-        id: &u64,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let Some(pin) = state.pins.get_mut(id)
-            && let Some((current, start)) = &pin.callback
-            && current == callback
-        {
-            pin.visible = start.elapsed() < Duration::from_millis(250);
-            pin.callback = None;
-        }
+});
+dispatch!(wl_callback::WlCallback, u64, |state, callback, _, id, _| {
+    if let Some(pin) = state.pins.get_mut(id)
+        && let Some((current, start)) = &pin.callback
+        && current == callback
+    {
+        pin.visible = start.elapsed() < Duration::from_millis(250);
+        pin.callback = None;
     }
-}
+});
 
 delegate_noop!(App: ignore wl_compositor::WlCompositor);
-impl Dispatch<wl_surface::WlSurface, u64> for App {
-    fn event(
-        state: &mut Self,
-        _: &wl_surface::WlSurface,
-        event: wl_surface::Event,
-        id: &u64,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let wl_surface::Event::PreferredBufferScale { factor } = event
-            && let Some(pin) = state.pins.get_mut(id)
-            && pin.scale != factor.max(1)
-        {
-            pin.scale = factor.max(1);
-            pin.invalidate();
-        }
+dispatch!(wl_surface::WlSurface, u64, |state, _, event, id, _| {
+    if let wl_surface::Event::PreferredBufferScale { factor } = event
+        && let Some(pin) = state.pins.get_mut(id)
+        && pin.scale != factor.max(1)
+    {
+        pin.scale = factor.max(1);
+        pin.invalidate();
     }
-}
+});
 delegate_noop!(App: ignore wl_buffer::WlBuffer);
 delegate_noop!(App: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(App: ignore wp_viewporter::WpViewporter);

@@ -42,27 +42,12 @@ let
     ];
     postInstall = "";
   });
+  # Inputs are replaced below, so only switches that add configure flags matter.
   photoshop = (imagemagick.override {
-    bzip2Support = false;
-    libX11Support = false;
-    libXtSupport = false;
-    fontconfigSupport = false;
-    freetypeSupport = false;
-    libjpegSupport = false;
-    djvulibreSupport = false;
-    openexrSupport = false;
     libjxlSupport = false;
-    libpngSupport = false;
     liblqr1Support = false;
-    libraqmSupport = false;
-    librawSupport = false;
     librsvgSupport = false;
-    libtiffSupport = false;
     libultrahdrSupport = false;
-    libxml2Support = false;
-    openjpegSupport = false;
-    libwebpSupport = false;
-    libheifSupport = false;
     fftwSupport = false;
   }).overrideAttrs (old: {
     outputs = ["out" "dev"];
@@ -113,11 +98,9 @@ let
       runHook postInstall
     '';
   });
-  jpeg = libjpeg.overrideAttrs (old: {
-    cmakeFlags = (old.cmakeFlags or []) ++ ["-DWITH_SYSTEM_ZLIB=ON"];
+  jpeg = libjpeg.overrideAttrs (_: {
     # Rust catches libjpeg's fatal errors through the C-unwind ABI.
     env.NIX_CFLAGS_COMPILE = "-fexceptions";
-    buildInputs = (old.buildInputs or []) ++ [zlib];
   });
 in lib.overrideDerivation (rustPlatform.buildRustPackage {
   pname = "perch";
@@ -135,9 +118,8 @@ in lib.overrideDerivation (rustPlatform.buildRustPackage {
   cargoLock.lockFile = ../Cargo.lock;
   strictDeps = true;
   stripAllList = ["bin"];
-  nativeBuildInputs = [cmake pkg-config rustPlatform.bindgenHook];
+  nativeBuildInputs = [pkg-config rustPlatform.bindgenHook];
   buildInputs = [
-    # Bundled zlib would override Perch's zlib-ng symbols.
     jpeg
     dav1d
     heif

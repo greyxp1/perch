@@ -10,7 +10,6 @@ use std::{
     fs::File,
     io::{BufReader, Read, Seek},
     num::NonZeroU32,
-    os::fd::AsRawFd,
     ptr::{NonNull, null, null_mut},
     sync::OnceLock,
     time::Duration,
@@ -64,29 +63,44 @@ fn error(e: impl ToString) -> ImageError {
     ImageError::Decoding(DecodingError::new(ImageFormatHint::Unknown, e.to_string()))
 }
 
-struct JxlFrames {
-    image: jxl_oxide::JxlImage,
-    index: usize,
+struct JxlInput {
     reader: BufReader<File>,
     buffer: [u8; 4096],
     valid: usize,
+}
+impl JxlInput {
+    /// Feeds newly read bytes and keeps the unconsumed tail. Returns false at end of input.
+    fn feed(&mut self, feed: impl FnOnce(&[u8]) -> jxl_oxide::Result<usize>) -> Result<bool> {
+        let n = self.reader.read(&mut self.buffer[self.valid..])?;
+        if n == 0 {
+            return Ok(false);
+        }
+        self.valid += n;
+        let consumed = feed(&self.buffer[..self.valid]).map_err(error)?;
+        self.buffer.copy_within(consumed..self.valid, 0);
+        self.valid -= consumed;
+        Ok(true)
+    }
+}
+
+struct JxlFrames {
+    image: jxl_oxide::JxlImage,
+    index: usize,
+    input: JxlInput,
     ended: bool,
 }
 impl JxlFrames {
     fn new(file: File, limit: usize) -> Result<Self> {
-        let mut reader = BufReader::new(file);
+        let mut input = JxlInput {
+            reader: BufReader::new(file),
+            buffer: [0; 4096],
+            valid: 0,
+        };
         let mut uninit = jxl_oxide::JxlImage::builder().build_uninit();
-        let mut buffer = [0; 4096];
-        let mut valid = 0;
         let mut image = loop {
-            let n = reader.read(&mut buffer[valid..])?;
-            if n == 0 {
+            if !input.feed(|bytes| uninit.feed_bytes(bytes))? {
                 return Err("incomplete JPEG XL header".into());
             }
-            valid += n;
-            let consumed = uninit.feed_bytes(&buffer[..valid]).map_err(error)?;
-            buffer.copy_within(consumed..valid, 0);
-            valid -= consumed;
             match uninit.try_init().map_err(error)? {
                 jxl_oxide::InitializeResult::NeedMoreData(next) => uninit = next,
                 jxl_oxide::InitializeResult::Initialized(image) => break image,
@@ -102,20 +116,9 @@ impl JxlFrames {
         Ok(Self {
             image,
             index: 0,
-            reader,
-            buffer,
-            valid,
+            input,
             ended: false,
         })
-    }
-    fn loops(&self) -> LoopCount {
-        self.image
-            .image_header()
-            .metadata
-            .animation
-            .as_ref()
-            .and_then(|a| NonZeroU32::new(a.num_loops))
-            .map_or(LoopCount::Infinite, LoopCount::Finite)
     }
 }
 impl Iterator for JxlFrames {
@@ -126,21 +129,12 @@ impl Iterator for JxlFrames {
                 return None;
             }
             let result = (|| -> Result<()> {
-                let n = self.reader.read(&mut self.buffer[self.valid..])?;
-                if n == 0 {
+                if !self.input.feed(|bytes| self.image.feed_bytes(bytes))? {
                     self.ended = true;
                     self.image.finalize().map_err(error)?;
                     if self.index >= self.image.num_loaded_keyframes() {
                         return Err("incomplete JPEG XL frame".into());
                     }
-                } else {
-                    self.valid += n;
-                    let consumed = self
-                        .image
-                        .feed_bytes(&self.buffer[..self.valid])
-                        .map_err(error)?;
-                    self.buffer.copy_within(consumed..self.valid, 0);
-                    self.valid -= consumed;
                 }
                 Ok(())
             })();
@@ -220,37 +214,17 @@ fn heif_result(error: heif::heif_error) -> Result<()> {
     }
 }
 
-macro_rules! heif_handle {
-    ($name:ident, $type:ident, $free:ident) => {
-        struct $name(NonNull<heif::$type>);
-        impl Drop for $name {
-            fn drop(&mut self) {
-                unsafe { heif::$free(self.0.as_ptr()) }
-            }
-        }
-    };
+handle! {
+    HeifContext(heif::heif_context) = heif::heif_context_free;
+    HeifTrack(heif::heif_track) = heif::heif_track_release;
+    HeifImage(heif::heif_image) = heif::heif_image_release;
+    HeifOptions(heif::heif_decoding_options) = heif::heif_decoding_options_free;
+    HeifHandle(heif::heif_image_handle) = heif::heif_image_handle_release;
 }
-heif_handle!(HeifContext, heif_context, heif_context_free);
-heif_handle!(HeifTrack, heif_track, heif_track_release);
-heif_handle!(HeifImage, heif_image, heif_image_release);
-heif_handle!(
-    HeifOptions,
-    heif_decoding_options,
-    heif_decoding_options_free
-);
 
 struct HeifPoster<'a> {
-    handle: NonNull<heif::heif_image_handle>,
+    handle: HeifHandle,
     context: &'a HeifContext,
-}
-impl Drop for HeifPoster<'_> {
-    fn drop(&mut self) {
-        unsafe { heif::heif_image_handle_release(self.handle.as_ptr()) }
-    }
-}
-
-fn fd_path(file: &File) -> String {
-    format!("/proc/self/fd/{}", file.as_raw_fd())
 }
 
 impl HeifContext {
@@ -265,7 +239,7 @@ impl HeifContext {
             NonNull::new(unsafe { heif::heif_context_alloc() })
                 .ok_or("could not allocate HEIF context")?,
         );
-        let path = CString::new(fd_path(file))?;
+        let path = CString::new(crate::fd_path(file))?;
         // The file reader opens and owns a separate descriptor for the context.
         heif_result(unsafe {
             heif::heif_context_read_from_file(context.0.as_ptr(), path.as_ptr(), null())
@@ -283,7 +257,7 @@ impl HeifContext {
             heif::heif_context_get_primary_image_handle(self.0.as_ptr(), &mut handle)
         })?;
         Ok(HeifPoster {
-            handle: NonNull::new(handle).ok_or("HEIF has no primary image")?,
+            handle: HeifHandle(NonNull::new(handle).ok_or("HEIF has no primary image")?),
             context: self,
         })
     }
@@ -348,7 +322,7 @@ fn heif_nclx(
 
 impl HeifPoster<'_> {
     fn size(&self) -> (u32, u32) {
-        let handle = self.handle.as_ptr();
+        let handle = self.handle.0.as_ptr();
         unsafe {
             (
                 heif::heif_image_handle_get_width(handle).max(0) as u32,
@@ -358,7 +332,7 @@ impl HeifPoster<'_> {
     }
 
     fn icc(&self) -> Result<Option<Vec<u8>>> {
-        let handle = self.handle.as_ptr();
+        let handle = self.handle.0.as_ptr();
         unsafe {
             heif_icc(
                 heif::heif_image_handle_get_raw_color_profile_size(handle),
@@ -557,7 +531,7 @@ fn avif_preview(
     profile: Option<&[u8]>,
     limit: usize,
 ) -> Result<Option<Pixels>> {
-    let handle = poster.handle.as_ptr();
+    let handle = poster.handle.0.as_ptr();
     let nclx =
         heif_nclx(|out| unsafe { heif::heif_image_handle_get_nclx_color_profile(handle, out) });
     let sdr = nclx.is_none_or(|(primaries, transfer)| {
@@ -581,7 +555,7 @@ fn avif_preview(
         return Ok(None);
     }
     let color = heif_color(profile, nclx)?;
-    let reader = File::open(fd_path(file))?;
+    let reader = File::open(crate::fd_path(file))?;
     let decoder = crate::image::decoder(
         BufReader::new(reader),
         Some(image::ImageFormat::Avif),
@@ -613,7 +587,7 @@ pub fn preview(file: File, kind: Kind, limit: usize) -> Result<(Pixels, bool)> {
                     return Ok((pixels, false));
                 }
                 let decoded = heif_decode(profile.is_some(), |out, space, chroma, opts| unsafe {
-                    heif::heif_decode_image(poster.handle.as_ptr(), out, space, chroma, opts)
+                    heif::heif_decode_image(poster.handle.0.as_ptr(), out, space, chroma, opts)
                 })?
                 .ok_or("missing decoded HEIF image")?;
                 drop(poster);
@@ -656,23 +630,18 @@ pub fn preview(file: File, kind: Kind, limit: usize) -> Result<(Pixels, bool)> {
     ))
 }
 
-pub fn frames(mut file: File) -> Result<(Frames<'static>, LoopCount)> {
-    match kind(&mut file)?.ok_or("image is not animated")? {
-        Kind::Jxl => {
-            let frames = JxlFrames::new(file, usize::MAX)?;
-            let loops = frames.loops();
-            Ok((Frames::new(Box::new(frames)), loops))
-        }
-        Kind::Heif | Kind::Avif => {
-            let context = HeifContext::open(&file)?;
-            if !context.has_sequence() {
-                return Err("image has no sequence".into());
-            }
-            let frames = HeifFrames::new(context)?;
-            Ok((
-                Frames::new(Box::new(frames)),
-                LoopCount::Finite(NonZeroU32::new(1).unwrap()),
-            ))
-        }
+pub fn frames(file: File, kind: Kind) -> Result<(Frames<'static>, LoopCount)> {
+    if let Kind::Jxl = kind {
+        let frames = JxlFrames::new(file, usize::MAX)?;
+        let loops = (frames.image.image_header().metadata.animation.as_ref())
+            .and_then(|a| NonZeroU32::new(a.num_loops))
+            .map_or(LoopCount::Infinite, LoopCount::Finite);
+        return Ok((Frames::new(Box::new(frames)), loops));
     }
+    let context = HeifContext::open(&file)?;
+    if !context.has_sequence() {
+        return Err("image has no sequence".into());
+    }
+    let frames = Frames::new(Box::new(HeifFrames::new(context)?));
+    Ok((frames, LoopCount::Finite(NonZeroU32::MIN)))
 }

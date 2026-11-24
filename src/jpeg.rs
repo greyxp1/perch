@@ -20,12 +20,7 @@ impl Drop for Jpeg {
     }
 }
 
-struct Transform(NonNull<c_void>);
-impl Drop for Transform {
-    fn drop(&mut self) {
-        unsafe { cmsDeleteTransform(self.0.as_ptr()) };
-    }
-}
+handle! { Transform(c_void) = cmsDeleteTransform; }
 
 struct DecodeFailed;
 unsafe extern "C-unwind" fn fail(_: j_common_ptr) {
@@ -48,7 +43,7 @@ fn color(jpeg: &mut jpeg_decompress_struct, cmyk: bool) -> Option<Transform> {
     let src = unsafe { NonNull::new(cmsOpenProfileFromMem(bytes.cast(), len)).map(Profile) };
     unsafe { libc::free(bytes.cast()) };
     let src = src?;
-    let dst = Profile(NonNull::new(unsafe { cmsCreate_sRGBProfile() })?);
+    let dst = Profile::srgb().ok()?;
     let format = match unsafe { cmsGetColorSpace(src.0.as_ptr()) } {
         CMYK if cmyk => PerchCmsFormat_CMYK8,
         RGB if !cmyk => PerchCmsFormat_RGBA8,

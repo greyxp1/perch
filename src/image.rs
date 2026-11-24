@@ -18,7 +18,6 @@ use image::{
 };
 use memmap2::{Mmap, MmapMut, MmapOptions};
 use rustix::fs::{MemfdFlags, SealFlags, fcntl_add_seals, memfd_create};
-use spng::raw::ChunkAvail;
 use std::{
     fs::File,
     io::{BufRead, Cursor, Read, Seek},
@@ -217,98 +216,63 @@ impl Pixels {
         Ok(pixels)
     }
 
-    fn png(reader: impl Read, cancelled: &dyn Fn() -> bool) -> Result<Self> {
-        let mut decoder = spng::raw::RawContext::new()?;
-        decoder.set_png_stream(reader)?;
-        let info = decoder.get_ihdr()?;
-        if u64::from(info.width) * u64::from(info.height) > crate::RENDER_BYTES as u64 / 8 {
+    fn png(reader: impl BufRead + Seek, cancelled: &dyn Fn() -> bool) -> Result<Self> {
+        let mut png = Png::open(reader)?;
+        let (width, height, _) = png.header();
+        if u64::from(width) * u64::from(height) > crate::RENDER_BYTES as u64 / 8 {
             return Self::png_stream(
-                decoder,
-                (0, 0, info.width, info.height),
-                crate::overview::fit((info.width, info.height), 2048),
+                png,
+                (0, 0, width, height),
+                crate::overview::fit((width, height), 2048),
                 cancelled,
             );
         }
-        let mut pixels = Self::new(info.width.try_into()?, info.height.try_into()?)?;
-        decoder.decode_image(
-            &mut pixels.mapping,
-            spng::Format::Rgba8,
-            spng::DecodeFlags::TRANSPARENCY,
-        )?;
-        decoder.decode_chunks()?;
-        let orientation = decoder
-            .get_exif()
-            .chunk_avail()?
-            .and_then(|exif| Orientation::from_exif_chunk(exif.data()))
-            .unwrap_or(Orientation::NoTransforms);
-        let profile = decoder.get_iccp().chunk_avail()?;
-        pixels.apply_color(
-            crate::color::Transform::new(profile.as_ref().map(|p| p.profile()))?,
-            false,
-        )?;
+        let mut pixels = Self::new(width.try_into()?, height.try_into()?)?;
+        png.decode(&mut pixels.mapping)?;
+        let orientation = png.orientation()?;
+        pixels.apply_color(png.color()?, false)?;
         pixels.premultiply()?;
         pixels.orient(orientation)
     }
     pub fn png_region(
-        reader: impl Read,
+        reader: impl BufRead + Seek,
         expected: (u32, u32),
         rect: (u32, u32, u32, u32),
         size: (u32, u32),
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Self> {
-        let mut decoder = spng::raw::RawContext::new()?;
-        decoder.set_png_stream(reader)?;
-        let info = decoder.get_ihdr()?;
-        if (info.width, info.height) != expected {
+        let png = Png::open(reader)?;
+        let (width, height, _) = png.header();
+        if (width, height) != expected {
             return Err("image changed while open".into());
         }
-        Self::png_stream(decoder, rect, size, cancelled)
+        Self::png_stream(png, rect, size, cancelled)
     }
-    fn png_stream<R: Read>(
-        mut decoder: spng::raw::RawContext<R>,
+    fn png_stream<R: BufRead + Seek>(
+        mut png: Png<R>,
         rect: (u32, u32, u32, u32),
         size: (u32, u32),
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Self> {
-        let info = decoder.get_ihdr()?;
-        let mut color = crate::color::Transform::new(
-            decoder
-                .get_iccp()
-                .chunk_avail()?
-                .as_ref()
-                .map(|p| p.profile()),
-        )?;
-        let mut raster = Rasterizer::new(rect, size, info.interlace_method == 0)?;
-        let len = (info.width as usize)
+        let (width, height, interlaced) = png.header();
+        let mut color = png.color()?;
+        let mut raster = Rasterizer::new(rect, size, !interlaced)?;
+        let len = (width as usize)
             .checked_mul(4)
             .ok_or("PNG row is too large")?;
         let mut row = Vec::new();
         row.try_reserve_exact(len)?;
         row.resize(len, 0);
-        decoder.decode_image(
-            &mut [],
-            spng::Format::Rgba8,
-            spng::DecodeFlags::TRANSPARENCY | spng::DecodeFlags::PROGRESSIVE,
-        )?;
         let alpha = MulDiv::default();
         loop {
             if cancelled() {
                 return Err("image loading cancelled".into());
             }
-            let row_info = decoder.get_row_info()?;
-            let done = match decoder.decode_scanline(&mut row) {
-                Ok(()) => false,
-                Err(spng::Error::Oi) => true,
-                Err(e) => return Err(e.into()),
+            // Adam7 supplies contiguous samples at a fixed horizontal stride on each pass.
+            let Some((y, start, step)) = png.row(&mut row)? else {
+                break;
             };
-            let y = row_info.row_num;
             if (rect.1..rect.3).contains(&y) {
-                // Adam7 supplies contiguous samples at a fixed horizontal stride on each pass.
-                let (start, step) = if info.interlace_method == 0 {
-                    (0, 1)
-                } else {
-                    [(0, 8), (4, 8), (0, 4), (2, 4), (0, 2), (1, 2), (0, 1)][row_info.pass as usize]
-                };
                 let first = rect.0.saturating_sub(start).div_ceil(step);
                 let end = rect.2.saturating_sub(start).div_ceil(step);
                 if end > first {
@@ -332,18 +296,10 @@ impl Pixels {
                     }
                 }
             }
-            if done {
-                break;
-            }
         }
-        decoder.decode_chunks()?;
-        let orientation = decoder
-            .get_exif()
-            .chunk_avail()?
-            .and_then(|exif| Orientation::from_exif_chunk(exif.data()))
-            .unwrap_or(Orientation::NoTransforms);
+        let orientation = png.orientation()?;
         let mut pixels = raster.finish()?;
-        pixels.original_size = (info.width, info.height);
+        pixels.original_size = (width, height);
         pixels.orient(orientation)
     }
     pub fn encoded_region(
@@ -359,18 +315,16 @@ impl Pixels {
         if cancelled() {
             return Err("image loading cancelled".into());
         }
-        let mut header = encoded_header(&bytes, format)?;
-        let orientation = header.orientation()?;
-        if header.dimensions() != expected {
-            return Err("image changed while open".into());
-        }
-        let mut pixels = if format == ImageFormat::Jpeg {
-            crate::jpeg::decode(&bytes, expected, (1, 1), rect, size, cancelled)?
-        } else {
-            Self::webp(&bytes, rect, size, true, &mut header)?
-        };
-        pixels.original_size = expected;
-        pixels.orient(orientation)
+        Self::encoded(&bytes, format, |header| {
+            if header.dimensions() != expected {
+                return Err("image changed while open".into());
+            }
+            if format == ImageFormat::Jpeg {
+                crate::jpeg::decode(&bytes, expected, (1, 1), rect, size, cancelled)
+            } else {
+                Self::webp(&bytes, rect, size, true, header)
+            }
+        })
     }
     pub fn apply_color(
         &mut self,
@@ -410,11 +364,7 @@ impl Pixels {
         let mut pixels = Self::new(w.try_into()?, h.try_into()?)?;
         pixels.mapping.copy_from_slice(image.as_bytes());
         pixels.orientation = orientation;
-        pixels.original_size = if orientation.to_exif() >= 5 {
-            (self.original_size.1, self.original_size.0)
-        } else {
-            self.original_size
-        };
+        pixels.original_size = oriented(self.original_size, orientation);
         Ok(pixels)
     }
     fn native(
@@ -426,59 +376,65 @@ impl Pixels {
     ) -> Result<Self> {
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes)?;
-        let mut header = encoded_header(&bytes, format)?;
-        let (w, h) = header.dimensions();
-        let orientation = header.orientation()?;
-        if u64::from(w) * u64::from(h) > limit as u64 / 4 {
-            return Err("image exceeds the decoded memory budget".into());
+        let decoded = Self::encoded(&bytes, format, |header| {
+            let (w, h) = header.dimensions();
+            if u64::from(w) * u64::from(h) > limit as u64 / 4 {
+                return Err("image exceeds the decoded memory budget".into());
+            }
+            if format == ImageFormat::Jpeg {
+                // libjpeg-turbo supports every k/8 reduction from 1/8 through 1.
+                let numerator = (1_u32..=8)
+                    .find(|&n| {
+                        (u64::from(w.max(h)) * u64::from(n)).div_ceil(8)
+                            >= u64::from(max_side.min(w.max(h)))
+                    })
+                    .unwrap();
+                let scaled = (
+                    (u64::from(w) * u64::from(numerator)).div_ceil(8) as u32,
+                    (u64::from(h) * u64::from(numerator)).div_ceil(8) as u32,
+                );
+                let size =
+                    if u64::from(scaled.0) * u64::from(scaled.1) > crate::RENDER_BYTES as u64 / 8 {
+                        crate::overview::fit(scaled, 2048)
+                    } else {
+                        scaled
+                    };
+                crate::jpeg::decode(
+                    &bytes,
+                    (w, h),
+                    (numerator, 8),
+                    (0, 0, scaled.0, scaled.1),
+                    size,
+                    cancelled,
+                )
+            } else {
+                let size = if u64::from(w) * u64::from(h) > crate::RENDER_BYTES as u64 / 8 {
+                    crate::overview::fit((w, h), max_side)
+                } else {
+                    (w, h)
+                };
+                Self::webp(&bytes, (0, 0, 0, 0), size, size != (w, h), header)
+            }
+        });
+        match decoded {
+            Err(_) if !cancelled() => Self::decode(Cursor::new(bytes), format, limit),
+            decoded => decoded,
         }
-        let decoded = if format == ImageFormat::Jpeg {
-            // libjpeg-turbo supports every k/8 reduction from 1/8 through 1.
-            let numerator = (1_u32..=8)
-                .find(|&n| {
-                    (u64::from(w.max(h)) * u64::from(n)).div_ceil(8)
-                        >= u64::from(max_side.min(w.max(h)))
-                })
-                .unwrap();
-            let scaled = (
-                (u64::from(w) * u64::from(numerator)).div_ceil(8) as u32,
-                (u64::from(h) * u64::from(numerator)).div_ceil(8) as u32,
-            );
-            let size = if u64::from(scaled.0) * u64::from(scaled.1) > crate::RENDER_BYTES as u64 / 8
-            {
-                crate::overview::fit(scaled, 2048)
-            } else {
-                scaled
-            };
-            crate::jpeg::decode(
-                &bytes,
-                (w, h),
-                (numerator, 8),
-                (0, 0, scaled.0, scaled.1),
-                size,
-                cancelled,
-            )
-        } else {
-            let (width, height) = if u64::from(w) * u64::from(h) > crate::RENDER_BYTES as u64 / 8 {
-                crate::overview::fit((w, h), max_side)
-            } else {
-                (w, h)
-            };
-            Self::webp(
-                &bytes,
-                (0, 0, 0, 0),
-                (width, height),
-                (width, height) != (w, h),
-                &mut header,
-            )
-        };
-        drop(header);
-        let mut pixels = match decoded {
-            Ok(pixels) => pixels,
-            Err(error) if cancelled() => return Err(error),
-            Err(_) => return Self::decode(Cursor::new(bytes), format, limit),
-        };
-        pixels.original_size = (w, h);
+    }
+
+    // Decodes JPEG or WebP natively and applies the orientation from the encoded header.
+    fn encoded(
+        bytes: &[u8],
+        format: ImageFormat,
+        decode: impl FnOnce(&mut dyn ImageDecoder) -> Result<Self>,
+    ) -> Result<Self> {
+        let mut header = ImageReader::with_format(Cursor::new(bytes), format);
+        header.no_limits();
+        let mut header = header.into_decoder()?;
+        let orientation = header.orientation()?;
+        let size = header.dimensions();
+        let mut pixels = decode(&mut header)?;
+        pixels.original_size = size;
         pixels.orient(orientation)
     }
 
@@ -487,7 +443,7 @@ impl Pixels {
         rect: (u32, u32, u32, u32),
         size: (u32, u32),
         scaled: bool,
-        header: &mut impl ImageDecoder,
+        header: &mut dyn ImageDecoder,
     ) -> Result<Self> {
         let mut pixels = Self::new(size.0.try_into()?, size.1.try_into()?)?;
         let crop = (
@@ -525,6 +481,7 @@ impl Pixels {
             config.options.use_scaling = i32::from(scaled);
             config.options.scaled_width = pixels.width;
             config.options.scaled_height = pixels.height;
+            config.options.use_threads = 1;
             let status = codecs::WebPDecode(bytes.as_ptr(), bytes.len(), &mut config);
             codecs::WebPFreeDecBuffer(&mut config.output);
             status
@@ -577,10 +534,103 @@ impl Pixels {
     }
 }
 
-fn encoded_header(bytes: &[u8], format: ImageFormat) -> Result<impl ImageDecoder + '_> {
-    let mut header = ImageReader::with_format(Cursor::new(bytes), format);
-    header.no_limits();
-    Ok(header.into_decoder()?)
+// Adam7 passes as first column, column step, first row and row step.
+static ADAM7: [(u32, u32, u32, u32); 7] = [
+    (0, 8, 0, 8),
+    (4, 8, 0, 8),
+    (0, 4, 4, 8),
+    (2, 4, 0, 4),
+    (0, 2, 2, 4),
+    (1, 2, 0, 2),
+    (0, 1, 1, 2),
+];
+
+/// PNG rows decoded to straight RGBA8.
+struct Png<R: BufRead + Seek> {
+    reader: png::Reader<R>,
+    // The png crate does not expose the Adam7 position of each row.
+    rows: Box<dyn Iterator<Item = (u32, u32, u32)>>,
+}
+impl<R: BufRead + Seek> Png<R> {
+    fn open(reader: R) -> Result<Self> {
+        let mut options = png::DecodeOptions::default();
+        options.set_ignore_adler32(false);
+        options.set_ignore_text_chunk(true);
+        let mut decoder = png::Decoder::new_with_options(reader, options);
+        // Perch budgets pixels itself, and the default limit rejects large metadata chunks.
+        decoder.set_limits(png::Limits { bytes: usize::MAX });
+        decoder.set_transformations(
+            png::Transformations::EXPAND
+                | png::Transformations::STRIP_16
+                | png::Transformations::ALPHA,
+        );
+        let reader = decoder.read_info()?;
+        let info = reader.info();
+        let (width, height) = (info.width, info.height);
+        let passes: &'static [_] = if info.interlaced {
+            &ADAM7
+        } else {
+            &[(0, 1, 0, 1)]
+        };
+        let rows =
+            passes
+                .iter()
+                .filter(move |pass| width > pass.0)
+                .flat_map(move |&(x, dx, y, dy)| {
+                    (y..height).step_by(dy as usize).map(move |y| (y, x, dx))
+                });
+        Ok(Self {
+            reader,
+            rows: Box::new(rows),
+        })
+    }
+    fn header(&self) -> (u32, u32, bool) {
+        let info = self.reader.info();
+        (info.width, info.height, info.interlaced)
+    }
+    fn color(&self) -> Result<Option<crate::color::Transform>> {
+        crate::color::Transform::new(self.reader.info().icc_profile.as_deref())
+    }
+    fn decode(&mut self, pixels: &mut [u8]) -> Result<()> {
+        if self.reader.next_frame(pixels)?.color_type == png::ColorType::GrayscaleAlpha {
+            expand_gray(pixels, pixels.len() / 4);
+        }
+        Ok(())
+    }
+    /// Decodes the next row and returns its image row, first column and column step.
+    fn row(&mut self, row: &mut [u8]) -> Result<Option<(u32, u32, u32)>> {
+        if self.reader.read_row(row)?.is_none() {
+            return Ok(None);
+        }
+        let (y, x, dx) = self.rows.next().ok_or("invalid PNG rows")?;
+        if self.reader.output_color_type().0 == png::ColorType::GrayscaleAlpha {
+            expand_gray(row, (self.reader.info().width - x).div_ceil(dx) as usize);
+        }
+        Ok(Some((y, x, dx)))
+    }
+    fn orientation(&mut self) -> Result<Orientation> {
+        // Later frames cannot change the APNG poster, so their damage must not reject it.
+        if self.reader.info().animation_control.is_none() {
+            self.reader.finish()?;
+        } else {
+            let _ = self.reader.finish();
+        }
+        Ok(self
+            .reader
+            .info()
+            .exif_metadata
+            .as_deref()
+            .and_then(Orientation::from_exif_chunk)
+            .unwrap_or(Orientation::NoTransforms))
+    }
+}
+
+// Expanding from the end keeps unread gray-alpha samples intact.
+fn expand_gray(data: &mut [u8], samples: usize) {
+    for i in (0..samples).rev() {
+        let (g, a) = (data[i * 2], data[i * 2 + 1]);
+        data[i * 4..i * 4 + 4].copy_from_slice(&[g, g, g, a]);
+    }
 }
 
 pub fn webp_info(bytes: &[u8]) -> Result<((u32, u32), bool)> {
@@ -604,6 +654,14 @@ pub fn webp_info(bytes: &[u8]) -> Result<((u32, u32), bool)> {
         (features.width as u32, features.height as u32),
         features.has_animation != 0,
     ))
+}
+
+pub fn oriented((w, h): (u32, u32), orientation: Orientation) -> (u32, u32) {
+    if orientation.to_exif() >= 5 {
+        (h, w)
+    } else {
+        (w, h)
+    }
 }
 
 pub fn limits(bytes: usize) -> image::Limits {
@@ -645,18 +703,19 @@ fn check_budget(decoder: &impl ImageDecoder, limit: usize) -> Result<()> {
 
 pub fn expand_rgb(source: &[u8], target: &mut [u8]) {
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("ssse3") {
-        // Detection gates the only instruction set extension used by this implementation.
-        unsafe {
-            expand_rgb_ssse3(source, target);
-        }
-        return;
-    }
-    for (source, target) in source
+    // Detection gates the only instruction set extension used by this implementation.
+    let (read, write) = if is_x86_feature_detected!("ssse3") {
+        unsafe { expand_rgb_ssse3(source, target) }
+    } else {
+        (0, 0)
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let (read, write) = (0, 0);
+    for (source, target) in source[read..]
         .as_chunks::<3>()
         .0
         .iter()
-        .zip(target.as_chunks_mut::<4>().0)
+        .zip(target[write..].as_chunks_mut::<4>().0)
     {
         target.copy_from_slice(&[source[0], source[1], source[2], 255]);
     }
@@ -664,7 +723,7 @@ pub fn expand_rgb(source: &[u8], target: &mut [u8]) {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "ssse3")]
-unsafe fn expand_rgb_ssse3(source: &[u8], target: &mut [u8]) {
+unsafe fn expand_rgb_ssse3(source: &[u8], target: &mut [u8]) -> (usize, usize) {
     use std::arch::x86_64::{
         _mm_loadu_si128, _mm_or_si128, _mm_set1_epi32, _mm_setr_epi8, _mm_shuffle_epi8,
         _mm_storeu_si128,
@@ -684,14 +743,7 @@ unsafe fn expand_rgb_ssse3(source: &[u8], target: &mut [u8]) {
         read += 12;
         write += 16;
     }
-    for (source, target) in source[read..]
-        .as_chunks::<3>()
-        .0
-        .iter()
-        .zip(target[write..].as_chunks_mut::<4>().0)
-    {
-        target.copy_from_slice(&[source[0], source[1], source[2], 255]);
-    }
+    (read, write)
 }
 
 pub struct Frame {

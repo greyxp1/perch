@@ -20,7 +20,7 @@ rustix = { version = "1.1.6", features = ["net", "fs", "process", "event"] }
 xkbcommon = "0.9"
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client"] }
-spng = { version = "0.2.0-alpha.3", features = ["zlib-ng"] }
+png = "0.18.1"
 
 [build-dependencies]
 bindgen = { version = "0.72.1", default-features = false, features = ["runtime"] }

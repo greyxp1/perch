@@ -248,15 +248,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cmake"
-version = "0.1.58"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
-dependencies = [
- "cc",
-]
-
-[[package]]
 name = "color_quant"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -888,19 +879,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "libz-sys"
-version = "1.1.33"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fee3f59f4321dab0c78d828942e7aa09d0bd8ad6e78a501977e6bf3d02938045"
-dependencies = [
- "cc",
- "cmake",
- "libc",
- "pkg-config",
- "vcpkg",
-]
-
-[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1118,9 +1096,9 @@ dependencies = [
  "memmap2",
  "moxcms",
  "pkg-config",
+ "png",
  "resvg",
  "rustix",
- "spng",
  "tiff",
  "wayland-client",
  "wayland-protocols",
@@ -1454,28 +1432,6 @@ name = "smallvec"
 version = "1.16.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
-
-[[package]]
-name = "spng"
-version = "0.2.0-alpha.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a748d4d67cc6343665fc4491870320c0e2278354e6783d053c4c6cd8b752dcd5"
-dependencies = [
- "bitflags",
- "libc",
- "spng-sys",
-]
-
-[[package]]
-name = "spng-sys"
-version = "0.2.0-alpha.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3935dd2f897bd3b30eaf8eee44e3f6c07b71c17f8db9d8d6ed9c8faf7eefc8a2"
-dependencies = [
- "cc",
- "libc",
- "libz-sys",
-]
 
 [[package]]
 name = "static_assertions"
